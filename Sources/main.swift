@@ -178,6 +178,26 @@ final class OverlayModel: ObservableObject {
     }
 
     private var timer: Timer?
+    private var memTimer: Timer?
+
+    // Native, cheap memory-pressure read (Mach) for a high-fidelity graph,
+    // sampled far more often than the 60s token refresh.
+    func currentPressurePct() -> Double? {
+        var stats = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride)
+        let kr = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        let pageSize = Double(vm_kernel_page_size)
+        let wired = Double(stats.wire_count) * pageSize
+        let compressed = Double(stats.compressor_page_count) * pageSize
+        let physical = Double(ProcessInfo.processInfo.physicalMemory)
+        guard physical > 0 else { return nil }
+        return 100.0 * (wired + compressed) / physical
+    }
 
     var statsURL: URL {
         let base = FileManager.default.homeDirectoryForCurrentUser
@@ -197,6 +217,12 @@ final class OverlayModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        // high-fidelity memory-pressure sampling (every 2s)
+        memTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self = self, let p = self.currentPressurePct() else { return }
+            self.memHistory.append(p)
+            if self.memHistory.count > 150 { self.memHistory.removeFirst(self.memHistory.count - 150) }
+        }
     }
 
     func load() {
@@ -205,10 +231,6 @@ final class OverlayModel: ObservableObject {
             let s = try JSONDecoder().decode(Stats.self, from: data)
             self.stats = s
             self.error = nil
-            if let m = s.memory {
-                memHistory.append(m.pressure_pct)
-                if memHistory.count > 60 { memHistory.removeFirst(memHistory.count - 60) }
-            }
         } catch {
             self.error = "parse error"
         }
