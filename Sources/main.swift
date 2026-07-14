@@ -357,17 +357,18 @@ struct OverlayView: View {
 
     @ViewBuilder
     func horizontalContent(_ s: Stats) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 8) { limitsSection(s) }.frame(width: 188)
+        HStack(alignment: .top, spacing: 11) {
+            VStack(alignment: .leading, spacing: 6) { limitsSection(s) }.frame(width: 176)
             vDivider
-            VStack(alignment: .leading, spacing: 8) {
-                totalsSection(s)
+            VStack(alignment: .leading, spacing: 6) { totalsCompact(s) }.frame(width: 132)
+            vDivider
+            VStack(alignment: .leading, spacing: 6) {
                 whereSection(s)
                 footer(s)
-            }.frame(width: 214)
+            }.frame(width: 190)
             if let m = s.memory {
                 vDivider
-                VStack(alignment: .leading, spacing: 8) { memorySection(m) }.frame(width: 214)
+                VStack(alignment: .leading, spacing: 6) { memorySection(m) }.frame(width: 206)
             }
         }
     }
@@ -537,6 +538,31 @@ struct OverlayView: View {
         }
     }
 
+    @ViewBuilder
+    func totalsCompact(_ s: Stats) -> some View {
+        SectionLabel(text: "Tokens")
+        compactTotal("TODAY", s.combined.today_total)
+        compactTotal("WEEK", s.combined.w7d)
+        compactTotal("LIFE", s.combined.lifetime_total)
+        HStack(spacing: 5) {
+            Circle().fill(Color.claudeAccent).frame(width: 5, height: 5)
+            Text(fmtTokens(s.claude.today_total)).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
+            Circle().fill(Color.codexAccent).frame(width: 5, height: 5)
+            Text(fmtTokens(s.codex.today_total)).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
+        }
+        Text("incl \(fmtTokens(s.combined.cache_read)) cache")
+            .font(.system(size: 8)).foregroundColor(.dimmer)
+    }
+
+    func compactTotal(_ label: String, _ v: Int) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.system(size: 8, weight: .heavy)).tracking(0.5).foregroundColor(.dim)
+                .frame(width: 44, alignment: .leading)
+            Text(fmtTokens(v)).font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundColor(.white).minimumScaleFactor(0.7).lineLimit(1)
+        }
+    }
+
     func bigTotal(_ label: String, _ v: Int, _ color: Color) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label).font(.system(size: 8, weight: .heavy)).tracking(0.8).foregroundColor(.dim)
@@ -573,7 +599,7 @@ struct OverlayView: View {
                 .font(.system(size: 9)).foregroundColor(.dimmer)
         }
         let maxTok = max(1, list.map { $0.tokens }.max() ?? 1)
-        ForEach(list.prefix(4)) { sess in
+        ForEach(list.prefix(model.horizontal ? 3 : 4)) { sess in
             HStack(spacing: 7) {
                 Circle().fill(sess.running ? Color.liveGreen : (sess.live ? Color.dim : Color.clear))
                     .frame(width: 5, height: 5)
