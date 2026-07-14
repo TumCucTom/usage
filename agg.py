@@ -26,6 +26,7 @@ RECENT_RETAIN = 10 * 86400   # keep per-event points for 10 days (covers 7d wind
 LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
 ACTIVE_SECS = 120            # a session counts as "running" (actively generating) if written this recently
 RUNNING_SECS = 60            # tighter window for the open/running/idle footer split
+RATE_RECENCY = 90 * 60       # only trust Codex rate-limit readings this fresh
 LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if used within this window
 
 # Claude Code does NOT expose rate-limit percentages locally, so Claude usage %
@@ -34,7 +35,7 @@ LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if us
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 9
+CACHE_VERSION = 10
 
 
 # ---------- helpers ----------
@@ -135,7 +136,7 @@ def parse_claude_file(path, now):
         "session_label": title if title else (proj + "·" + os.path.basename(path)[:6]),
         "sessions": sorted(sessions), "last_activity": last_activity,
         "days": days, "recent": recent,
-        "codex_rate": None, "codex_rate_ts": None,
+        "codex_rate": None,
     }
 
 
@@ -147,8 +148,7 @@ def parse_codex_file(path, now):
     last_activity = 0.0
     horizon = now - RECENT_RETAIN
     model = "codex"
-    rate = None
-    rate_ts = None
+    best_win = {}   # window key -> highest recent rate-limit reading
     try:
         with open(path, "r", errors="ignore") as fh:
             for line in fh:
@@ -189,9 +189,22 @@ def parse_codex_file(path, now):
                         if ep >= horizon:
                             recent.append([ep, model, tot])
                     rl = p.get("rate_limits")
-                    if isinstance(rl, dict) and ep and (rate_ts is None or ep > rate_ts):
-                        rate = rl
-                        rate_ts = ep
+                    if isinstance(rl, dict) and ep and ep >= now - RATE_RECENCY:
+                        for slot in ("primary", "secondary"):
+                            w = rl.get(slot)
+                            if not isinstance(w, dict) or w.get("used_percent") is None:
+                                continue
+                            win = w.get("window_minutes") or 0
+                            key = "five_h" if 0 < win <= 600 else ("weekly" if win else None)
+                            if not key:
+                                continue
+                            up = w["used_percent"]
+                            cur = best_win.get(key)
+                            # keep the highest recent reading (real plan usage, not 0% noise)
+                            if cur is None or up > cur["used_percent"] or (up == cur["used_percent"] and ep > cur["ts"]):
+                                best_win[key] = {"used_percent": up, "resets_at": w.get("resets_at"),
+                                                 "window_minutes": win, "ts": ep,
+                                                 "plan": rl.get("plan_type")}
     except Exception:
         return None
     if sid is None:
@@ -202,7 +215,7 @@ def parse_codex_file(path, now):
         "session_label": proj + "·" + str(sid)[:6],
         "sessions": [sid], "last_activity": last_activity,
         "days": days, "recent": recent,
-        "codex_rate": rate, "codex_rate_ts": rate_ts,
+        "codex_rate": best_win or None,
     }
 
 
@@ -298,29 +311,32 @@ def agg_provider(contribs, now):
 
 
 def latest_codex_rate(contribs):
-    """Return normalized {five_h, weekly, plan, as_of} mapping each window by
-    its window_minutes (slots 'primary'/'secondary' are not positionally fixed)."""
-    best = None
-    best_ts = -1
+    """Aggregate the highest recent reading per window across all Codex sessions.
+    Concurrent sessions report conflicting values (plan vs API-key contexts, some 0%),
+    so the max recent reading reflects real plan usage; 0% noise is ignored."""
+    agg = {}
     for c in contribs:
-        if c.get("codex_rate") and c.get("codex_rate_ts", 0) and c["codex_rate_ts"] > best_ts:
-            best = c["codex_rate"]; best_ts = c["codex_rate_ts"]
-    if best is None:
-        return None
-    five_h = weekly = None
-    for slot in ("primary", "secondary"):
-        w = best.get(slot)
-        if not isinstance(w, dict):
+        br = c.get("codex_rate")
+        if not isinstance(br, dict):
             continue
-        win = w.get("window_minutes") or 0
-        entry = {"used_percent": w.get("used_percent"), "resets_at": w.get("resets_at"),
-                 "window_minutes": win}
-        if win and win <= 600:          # ~5h window
-            five_h = entry
-        elif win:                        # weekly (~10080) or other long window
-            weekly = entry
-    return {"five_h": five_h, "weekly": weekly,
-            "plan": best.get("plan_type"), "as_of": best_ts}
+        for key, e in br.items():
+            cur = agg.get(key)
+            if cur is None or e["used_percent"] > cur["used_percent"] or \
+               (e["used_percent"] == cur["used_percent"] and e["ts"] > cur["ts"]):
+                agg[key] = e
+    if not agg:
+        return None
+
+    def out(e):
+        if not e:
+            return None
+        return {"used_percent": e["used_percent"], "resets_at": e.get("resets_at"),
+                "window_minutes": e.get("window_minutes")}
+
+    plan = next((e.get("plan") for e in agg.values() if e.get("plan")), None)
+    as_of = max((e["ts"] for e in agg.values()), default=None)
+    return {"five_h": out(agg.get("five_h")), "weekly": out(agg.get("weekly")),
+            "plan": plan, "as_of": as_of}
 
 
 def top_n(d, n=4):
