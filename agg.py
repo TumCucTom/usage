@@ -26,7 +26,13 @@ RECENT_RETAIN = 10 * 86400   # keep per-event points for 10 days (covers 7d wind
 LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
 ACTIVE_SECS = 120            # a session counts as "running" if its transcript was written this recently
 
-CACHE_VERSION = 4
+# Claude Code does NOT expose rate-limit percentages locally, so Claude usage %
+# is computed against these configurable caps (cache-inclusive tokens). Adjust to
+# match your plan's real limits if you know them.
+CLAUDE_5H_LIMIT = 2_000_000_000
+CLAUDE_WEEK_LIMIT = 12_000_000_000
+
+CACHE_VERSION = 6
 
 
 # ---------- helpers ----------
@@ -73,9 +79,20 @@ def parse_claude_file(path, now):
     sessions = set()
     last_activity = 0.0
     horizon = now - RECENT_RETAIN
+    title = None
     try:
         with open(path, "r", errors="ignore") as fh:
             for line in fh:
+                # capture a human session title if the user named/renamed it
+                if '"custom-title"' in line or '"agent-name"' in line or '"type":"summary"' in line:
+                    try:
+                        j = json.loads(line)
+                        t = j.get("customTitle") or j.get("summary") or j.get("agentName")
+                        if t:
+                            title = t.strip()
+                    except Exception:
+                        pass
+                    continue
                 if '"usage"' not in line:
                     continue
                 try:
@@ -106,15 +123,13 @@ def parse_claude_file(path, now):
                 day = local_day(ep) if ep else "unknown"
                 dd = days.setdefault(day, {})
                 add4(dd, model, (it, ot, cc, cr))
-                # headline metric = non-cache generation tokens (input+output),
-                # matching what the Claude app reports; cache tracked separately
                 if ep >= horizon:
-                    recent.append([ep, model, it + ot])
+                    recent.append([ep, model, it + ot + cc + cr])
     except Exception:
         return None
     return {
         "provider": "claude", "project": proj,
-        "session_label": proj + "·" + os.path.basename(path)[:6],
+        "session_label": title if title else (proj + "·" + os.path.basename(path)[:6]),
         "sessions": sorted(sessions), "last_activity": last_activity,
         "days": days, "recent": recent,
         "codex_rate": None, "codex_rate_ts": None,
@@ -131,9 +146,20 @@ def parse_codex_file(path, now):
     model = "codex"
     rate = None
     rate_ts = None
+    title = None
     try:
         with open(path, "r", errors="ignore") as fh:
             for line in fh:
+                if title is None and '"user_message"' in line:
+                    try:
+                        pl = json.loads(line).get("payload", {})
+                        m = pl.get("message") or pl.get("text") or pl.get("content")
+                        if isinstance(m, list):
+                            m = " ".join(x.get("text", "") for x in m if isinstance(x, dict))
+                        if m and not str(m).lstrip().startswith("<"):
+                            title = " ".join(str(m).split())[:46]
+                    except Exception:
+                        pass
                 if ('token_count' not in line and '"cwd"' not in line
                         and '"model"' not in line):
                     continue
@@ -165,10 +191,11 @@ def parse_codex_file(path, now):
                     if tot:
                         day = local_day(ep) if ep else "unknown"
                         dd = days.setdefault(day, {})
-                        # [non-cache input, output(incl reasoning), 0, cached-read]
-                        add4(dd, model, (nc_in, ot + ro, 0, cin))
+                        # slots [fresh input, output, 0, cached-read]; sum == total_tokens
+                        out = tot - it if tot > it else ot   # exact output, avoids reasoning double-count
+                        add4(dd, model, (nc_in, out, 0, cin))
                         if ep >= horizon:
-                            recent.append([ep, model, nc_in + ot + ro])
+                            recent.append([ep, model, tot])
                     rl = p.get("rate_limits")
                     if isinstance(rl, dict) and ep and (rate_ts is None or ep > rate_ts):
                         rate = rl
@@ -179,7 +206,7 @@ def parse_codex_file(path, now):
         sid = os.path.basename(path)
     return {
         "provider": "codex", "project": proj,
-        "session_label": proj + "·" + str(sid)[:6],
+        "session_label": title if title else (proj + "·" + str(sid)[:6]),
         "sessions": [sid], "last_activity": last_activity,
         "days": days, "recent": recent,
         "codex_rate": rate, "codex_rate_ts": rate_ts,
@@ -215,8 +242,8 @@ def blank():
 
 
 def total_of(b):
-    # non-cache generation tokens only (input + output), for app-comparable numbers
-    return b["input"] + b["output"]
+    # all tokens processed, including cache creation + cache reads
+    return b["input"] + b["output"] + b["cache_creation"] + b["cache_read"]
 
 
 def agg_provider(contribs, now):
@@ -240,7 +267,7 @@ def agg_provider(contribs, now):
         proj_total = 0
         for day, models in c["days"].items():
             for model, v in models.items():
-                tot = v[0] + v[1]   # non-cache generation tokens
+                tot = v[0] + v[1] + v[2] + v[3]   # all tokens incl cache
                 life["input"] += v[0]; life["output"] += v[1]
                 life["cache_creation"] += v[2]; life["cache_read"] += v[3]
                 by_model[model] = by_model.get(model, 0) + tot
@@ -416,6 +443,12 @@ def main():
             "lifetime_breakdown": claude["lifetime"],
             "top_models": top_n(claude["by_model"]),
             "top_projects": top_n(claude["by_project"]),
+            "limits_pct": {
+                "five_h": round(100.0 * claude["w5h"] / CLAUDE_5H_LIMIT, 1),
+                "weekly": round(100.0 * claude["w7d"] / CLAUDE_WEEK_LIMIT, 1),
+                "five_h_limit": CLAUDE_5H_LIMIT,
+                "weekly_limit": CLAUDE_WEEK_LIMIT,
+            },
         },
         "codex": {
             **{k: codex[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d", "sessions", "live")},

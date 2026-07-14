@@ -22,6 +22,13 @@ struct CodexLimits: Decodable {
     let as_of: Double?
 }
 
+struct LimitsPct: Decodable {
+    let five_h: Double
+    let weekly: Double
+    let five_h_limit: Int
+    let weekly_limit: Int
+}
+
 struct Breakdown: Decodable {
     let input: Int
     let output: Int
@@ -41,6 +48,7 @@ struct Provider: Decodable {
     var top_models: [NameTokens] = []
     var top_projects: [NameTokens] = []
     var limits: CodexLimits? = nil
+    var limits_pct: LimitsPct? = nil
 }
 
 struct Combined: Decodable {
@@ -300,26 +308,27 @@ struct OverlayView: View {
             Text("no limit data cached — run Codex once")
                 .font(.system(size: 9)).foregroundColor(.dimmer).padding(.leading, 12)
         }
-        // Claude — no limit % is stored locally; show token volume instead
+        // Claude — % vs a configurable cap (Claude Code stores no real limit locally)
         HStack(spacing: 6) {
             Circle().fill(Color.claudeAccent).frame(width: 6, height: 6)
             Text("Claude").font(.system(size: 10, weight: .semibold)).foregroundColor(.white.opacity(0.85))
             Spacer()
-            Text("no local % — tokens used")
+            Text("est · vs set cap")
                 .font(.system(size: 8)).foregroundColor(.dimmer)
         }
-        HStack(spacing: 8) {
-            claudeUse("5h", s.claude.w5h)
-            claudeUse("Week", s.claude.w7d)
-            Spacer()
-        }.padding(.leading, 12)
+        if let lp = s.claude.limits_pct {
+            pctRow("5h", lp.five_h, .claudeAccent)
+            pctRow("Week", lp.weekly, .claudeAccent)
+        }
     }
 
-    func claudeUse(_ label: String, _ tokens: Int) -> some View {
-        HStack(spacing: 4) {
-            Text(label).font(.system(size: 9)).foregroundColor(.dim)
-            Text(fmtTokens(tokens)).font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.8))
+    func pctRow(_ label: String, _ pct: Double, _ color: Color) -> some View {
+        HStack {
+            Text(label).font(.system(size: 10, weight: .semibold)).foregroundColor(.white.opacity(0.8))
+                .frame(width: 34, alignment: .leading)
+            MeterBar(fraction: pct / 100, color: pct >= 85 ? .red : color)
+            Text("\(Int(pct))%").font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.85)).frame(width: 40, alignment: .trailing)
         }
     }
 
@@ -384,7 +393,7 @@ struct OverlayView: View {
             splitPill("Claude", .claudeAccent, s.claude.today_total)
             splitPill("Codex", .codexAccent, s.codex.today_total)
             Spacer()
-            Text("non-cache · +\(fmtTokens(s.combined.cache_read)) cache")
+            Text("incl. \(fmtTokens(s.combined.cache_read)) cache")
                 .font(.system(size: 8)).foregroundColor(.dimmer)
         }
     }
@@ -549,7 +558,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = blur
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false    // window shadow is square around the rounded card — drop it for clean edges
         panel.level = .statusBar   // above ordinary app windows (e.g. Slack), stays at the forefront
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
