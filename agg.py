@@ -24,7 +24,8 @@ STATS_PATH = os.path.join(SUPPORT, "stats.json")
 
 RECENT_RETAIN = 10 * 86400   # keep per-event points for 10 days (covers 7d window + margin)
 LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
-ACTIVE_SECS = 120            # a session counts as "running" if its transcript was written this recently
+ACTIVE_SECS = 120            # a session counts as "running" (actively generating) if written this recently
+LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if used within this window
 
 # Claude Code does NOT expose rate-limit percentages locally, so Claude usage %
 # is computed against these configurable caps (cache-inclusive tokens). Adjust to
@@ -32,7 +33,7 @@ ACTIVE_SECS = 120            # a session counts as "running" if its transcript w
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 
 
 # ---------- helpers ----------
@@ -128,7 +129,7 @@ def parse_claude_file(path, now):
     except Exception:
         return None
     return {
-        "provider": "claude", "project": proj,
+        "provider": "claude", "project": proj, "path": path,
         "named": title is not None,
         "session_label": title if title else (proj + "·" + os.path.basename(path)[:6]),
         "sessions": sorted(sessions), "last_activity": last_activity,
@@ -195,7 +196,7 @@ def parse_codex_file(path, now):
     if sid is None:
         sid = os.path.basename(path)
     return {
-        "provider": "codex", "project": proj,
+        "provider": "codex", "project": proj, "path": path,
         "named": False,   # Codex has no user-given --resume session names
         "session_label": proj + "·" + str(sid)[:6],
         "sessions": [sid], "last_activity": last_activity,
@@ -269,9 +270,11 @@ def agg_provider(contribs, now):
         by_project[c["project"]] = by_project.get(c["project"], 0) + proj_total
         if c.get("named"):   # only sessions with a real --resume name
             lbl = c["session_label"]
-            ni = named_info.setdefault(lbl, {"tokens": 0, "last": 0.0})
+            ni = named_info.setdefault(lbl, {"tokens": 0, "last": 0.0, "paths": []})
             ni["tokens"] += proj_total
             ni["last"] = max(ni["last"], c["last_activity"] or 0.0)
+            if c.get("path"):
+                ni["paths"].append(c["path"])
         for ep, model, tot in c["recent"]:
             if ep >= cut7:
                 w7d += tot
@@ -374,6 +377,24 @@ def running_resume_names():
     return names
 
 
+def lsof_open_transcripts():
+    """Transcript files currently held open by a running claude/codex process."""
+    try:
+        out = subprocess.run(["lsof", "-c", "claude", "-c", "codex"],
+                             capture_output=True, text=True, timeout=6).stdout
+    except Exception:
+        return set()
+    open_paths = set()
+    for line in out.splitlines():
+        j = line.find("/")
+        if j < 0:
+            continue
+        p = line[j:].strip()
+        if p.endswith(".jsonl") and ("/.claude/projects/" in p or "/.codex/sessions/" in p):
+            open_paths.add(p)
+    return open_paths
+
+
 def count_recent_files(files, now, secs):
     n = 0
     cut = now - secs
@@ -433,18 +454,26 @@ def main():
         for k, v in src["by_project"].items():
             by_project_all[k] = by_project_all.get(k, 0) + v
     resume_names = running_resume_names()
+    open_files = lsof_open_transcripts()
     named_all = {}
     for src in (claude, codex):
         for k, v in src["named_info"].items():
-            e = named_all.setdefault(k, {"tokens": 0, "last": 0.0})
+            e = named_all.setdefault(k, {"tokens": 0, "last": 0.0, "paths": []})
             e["tokens"] += v["tokens"]
             e["last"] = max(e["last"], v["last"])
-    named_sessions = [
-        {"name": k, "tokens": v["tokens"], "last_activity": v["last"],
-         "running": k in resume_names}
-        for k, v in named_all.items()
-    ]
-    # keep the 50 most recent so all three UI views (usage/current/recent) have data
+            e["paths"].extend(v.get("paths", []))
+    named_sessions = []
+    for k, v in named_all.items():
+        running = v["last"] >= now - ACTIVE_SECS       # actively generating
+        # live = process open (by --resume name or held-open transcript) OR recently used
+        live = (k in resume_names
+                or any(p in open_files for p in v["paths"])
+                or v["last"] >= now - LIVE_TOLERANCE)
+        named_sessions.append({
+            "name": k, "tokens": v["tokens"], "last_activity": v["last"],
+            "running": running, "live": live,
+        })
+    # keep the 50 most recent so all three UI views (usage/live/recent) have data
     named_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
     named_sessions = named_sessions[:50]
 

@@ -14,6 +14,7 @@ struct NamedSession: Decodable, Identifiable {
     let tokens: Int
     let last_activity: Double
     let running: Bool
+    var live: Bool = false
     var id: String { name }
 }
 
@@ -447,7 +448,7 @@ struct OverlayView: View {
         let maxTok = max(1, list.map { $0.tokens }.max() ?? 1)
         ForEach(list.prefix(4)) { sess in
             HStack(spacing: 7) {
-                Circle().fill(sess.running ? Color.liveGreen : Color.clear)
+                Circle().fill(sess.running ? Color.liveGreen : (sess.live ? Color.dim : Color.clear))
                     .frame(width: 5, height: 5)
                 Text(sess.name).font(.system(size: 10)).foregroundColor(.white.opacity(0.78))
                     .frame(width: 104, alignment: .leading).lineLimit(1).truncationMode(.middle)
@@ -471,7 +472,7 @@ struct OverlayView: View {
     func sortedSessions(_ arr: [NamedSession]) -> [NamedSession] {
         switch sessView {
         case .usage:   return arr.sorted { $0.tokens > $1.tokens }
-        case .current: return arr.filter { $0.running }.sorted { $0.last_activity > $1.last_activity }
+        case .current: return arr.filter { $0.live }.sorted { $0.last_activity > $1.last_activity }
         case .recent:  return arr.sorted { $0.last_activity > $1.last_activity }
         }
     }
