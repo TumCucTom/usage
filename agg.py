@@ -27,7 +27,25 @@ LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
 ACTIVE_SECS = 120            # a session counts as "running" (actively generating) if written this recently
 RUNNING_SECS = 60            # tighter window for the open/running/idle footer split
 RATE_RECENCY = 90 * 60       # only trust Codex rate-limit readings this fresh
+RATE_WINDOW_TOL = 20 * 60    # resets_at within this = same limit window (drift, not a reset)
 LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if used within this window
+
+
+def _rate_beats(new, old):
+    """True if reading `new` should replace `old` for the same window key.
+
+    A meaningfully later resets_at means a newer limit window (e.g. right after a
+    reset, when resets_at jumps forward by the full window length) and always wins,
+    so a stale pre-reset percentage can't linger. Within the same window (resets_at
+    values differ only by drift) the higher percent wins, so concurrent 0% API-key
+    noise never masks real plan usage."""
+    nra = new.get("resets_at") or 0
+    ora = old.get("resets_at") or 0
+    if abs(nra - ora) > RATE_WINDOW_TOL:
+        return nra > ora
+    if new["used_percent"] != old["used_percent"]:
+        return new["used_percent"] > old["used_percent"]
+    return new["ts"] > old["ts"]
 
 # Claude Code does NOT expose rate-limit percentages locally, so Claude usage %
 # is computed against these configurable caps (cache-inclusive tokens). Adjust to
@@ -199,12 +217,18 @@ def parse_codex_file(path, now):
                             if not key:
                                 continue
                             up = w["used_percent"]
+                            ra = w.get("resets_at")
+                            # skip readings whose window has already reset — the
+                            # percentage describes an expired window and is stale.
+                            if ra is not None and ra <= now:
+                                continue
+                            cand = {"used_percent": up, "resets_at": ra,
+                                    "window_minutes": win, "ts": ep,
+                                    "plan": rl.get("plan_type")}
                             cur = best_win.get(key)
-                            # keep the highest recent reading (real plan usage, not 0% noise)
-                            if cur is None or up > cur["used_percent"] or (up == cur["used_percent"] and ep > cur["ts"]):
-                                best_win[key] = {"used_percent": up, "resets_at": w.get("resets_at"),
-                                                 "window_minutes": win, "ts": ep,
-                                                 "plan": rl.get("plan_type")}
+                            # newest window wins; ties within a window keep the real usage
+                            if cur is None or _rate_beats(cand, cur):
+                                best_win[key] = cand
     except Exception:
         return None
     if sid is None:
@@ -325,19 +349,23 @@ def agg_provider(contribs, now):
     }
 
 
-def latest_codex_rate(contribs):
+def latest_codex_rate(contribs, now):
     """Aggregate the highest recent reading per window across all Codex sessions.
     Concurrent sessions report conflicting values (plan vs API-key contexts, some 0%),
-    so the max recent reading reflects real plan usage; 0% noise is ignored."""
+    so the max recent reading reflects real plan usage; 0% noise is ignored.
+    Readings whose window has already reset are dropped so a limit reset shows
+    immediately instead of being held at the stale pre-reset percentage."""
     agg = {}
     for c in contribs:
         br = c.get("codex_rate")
         if not isinstance(br, dict):
             continue
         for key, e in br.items():
+            ra = e.get("resets_at")
+            if ra is not None and ra <= now:
+                continue
             cur = agg.get(key)
-            if cur is None or e["used_percent"] > cur["used_percent"] or \
-               (e["used_percent"] == cur["used_percent"] and e["ts"] > cur["ts"]):
+            if cur is None or _rate_beats(e, cur):
                 agg[key] = e
     if not agg:
         return None
@@ -743,7 +771,7 @@ def main():
             "lifetime_breakdown": codex["lifetime"],
             "top_models": top_n(codex["by_model"]),
             "top_projects": top_n(codex["by_project"]),
-            "limits": latest_codex_rate(cx),
+            "limits": latest_codex_rate(cx, now),
         },
         "combined": combined,
         "top_projects": top_n(by_project_all, 5),
