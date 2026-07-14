@@ -356,6 +356,40 @@ def count_open_sessions():
     return {"claude_open": claude_open, "codex_open": codex_open, "avail": True}
 
 
+def claude_usage():
+    """Fetch REAL Claude usage from the same endpoint /usage uses, authenticated
+    with the OAuth token in the login Keychain. Metadata endpoint — no token cost.
+    Returns {five_h, weekly, ok} or None if unavailable (offline / locked / expired)."""
+    try:
+        raw = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5).stdout
+        tok = (json.loads(raw).get("claudeAiOauth") or {}).get("accessToken")
+        if not tok:
+            return None
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={"Authorization": "Bearer " + tok,
+                     "anthropic-beta": "oauth-2025-04-20",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+    def win(o):
+        if not isinstance(o, dict) or o.get("utilization") is None:
+            return None
+        return {"used_percent": round(float(o["utilization"]), 1),
+                "resets_at": parse_ts(o.get("resets_at"))}
+
+    fh, sd = win(d.get("five_hour")), win(d.get("seven_day"))
+    if fh is None and sd is None:
+        return None
+    return {"five_h": fh, "weekly": sd, "ok": True}
+
+
 def running_resume_names():
     """Names currently open via `claude --resume <name>` processes."""
     try:
@@ -504,6 +538,7 @@ def main():
                 "five_h_limit": CLAUDE_5H_LIMIT,
                 "weekly_limit": CLAUDE_WEEK_LIMIT,
             },
+            "real_limits": claude_usage(),
         },
         "codex": {
             **{k: codex[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d", "sessions", "live")},

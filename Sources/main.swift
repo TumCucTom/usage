@@ -40,6 +40,12 @@ struct LimitsPct: Decodable {
     let weekly_limit: Int
 }
 
+struct RealLimits: Decodable {
+    let five_h: LimitWindow?
+    let weekly: LimitWindow?
+    let ok: Bool
+}
+
 struct Breakdown: Decodable {
     let input: Int
     let output: Int
@@ -60,6 +66,7 @@ struct Provider: Decodable {
     var top_projects: [NameTokens] = []
     var limits: CodexLimits? = nil
     var limits_pct: LimitsPct? = nil
+    var real_limits: RealLimits? = nil
 }
 
 struct Combined: Decodable {
@@ -320,15 +327,20 @@ struct OverlayView: View {
             Text("no limit data cached — run Codex once")
                 .font(.system(size: 9)).foregroundColor(.dimmer).padding(.leading, 12)
         }
-        // Claude — % vs a configurable cap (Claude Code stores no real limit locally)
+        // Claude — real usage from /usage endpoint when available, else est. vs cap
+        let real = s.claude.real_limits
+        let live = real?.ok == true
         HStack(spacing: 6) {
             Circle().fill(Color.claudeAccent).frame(width: 6, height: 6)
             Text("Claude").font(.system(size: 10, weight: .semibold)).foregroundColor(.white.opacity(0.85))
             Spacer()
-            Text("est · vs set cap")
-                .font(.system(size: 8)).foregroundColor(.dimmer)
+            Text(live ? "live · /usage" : "est · vs set cap")
+                .font(.system(size: 8)).foregroundColor(live ? .claudeAccent : .dimmer)
         }
-        if let lp = s.claude.limits_pct {
+        if live, let r = real {
+            limitRow("5h", r.five_h, .claudeAccent)
+            limitRow("Week", r.weekly, .claudeAccent)
+        } else if let lp = s.claude.limits_pct {
             pctRow("5h", lp.five_h, .claudeAccent)
             pctRow("Week", lp.weekly, .claudeAccent)
         }
@@ -345,13 +357,13 @@ struct OverlayView: View {
     }
 
     @ViewBuilder
-    func limitRow(_ label: String, _ w: LimitWindow?) -> some View {
+    func limitRow(_ label: String, _ w: LimitWindow?, _ accent: Color = .codexAccent) -> some View {
         if let w = w, let pct = w.used_percent {
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
                     Text(label).font(.system(size: 10, weight: .semibold)).foregroundColor(.white.opacity(0.8))
                         .frame(width: 34, alignment: .leading)
-                    MeterBar(fraction: pct / 100, color: pct >= 85 ? .red : .codexAccent)
+                    MeterBar(fraction: pct / 100, color: pct >= 85 ? .red : accent)
                     Text("\(Int(pct))%").font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(.white.opacity(0.85)).frame(width: 40, alignment: .trailing)
                 }
