@@ -406,7 +406,7 @@ struct OverlayView: View {
     @ViewBuilder
     func horizontalContent(_ s: Stats) -> some View {
         HStack(alignment: .top, spacing: 11) {
-            VStack(alignment: .leading, spacing: 6) { limitsSection(s) }.frame(width: 176)
+            limitsColumns(s)
             vDivider
             VStack(alignment: .leading, spacing: 6) { totalsCompact(s) }.frame(width: 132)
             vDivider
@@ -476,12 +476,35 @@ struct OverlayView: View {
     // Limits (Codex = real %, Claude = token volume, no local %) ----------
     @ViewBuilder
     func limitsSection(_ s: Stats) -> some View {
-        HStack {
-            SectionLabel(text: "Limits")
-            Spacer()
-            Text("% used").font(.system(size: 8)).foregroundColor(.dimmer)
+        Group {
+            HStack {
+                SectionLabel(text: "Limits")
+                Spacer()
+                Text("% used").font(.system(size: 8)).foregroundColor(.dimmer)
+            }
+            codexLimits(s)
+            claudeLimits(s)
         }
-        // Codex — real percentages from its logs
+    }
+
+    // horizontal view: Codex and Claude limits as two side-by-side boxes
+    @ViewBuilder
+    func limitsColumns(_ s: Stats) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel(text: "Codex")
+                codexLimits(s)
+            }.frame(width: 150)
+            vDivider
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel(text: "Claude")
+                claudeLimits(s)
+            }.frame(width: 150)
+        }
+    }
+
+    @ViewBuilder
+    func codexLimits(_ s: Stats) -> some View {
         HStack(spacing: 6) {
             Circle().fill(Color.codexAccent).frame(width: 6, height: 6)
             Text("Codex").font(.system(size: 10, weight: .semibold)).foregroundColor(.white.opacity(0.85))
@@ -501,7 +524,10 @@ struct OverlayView: View {
             Text("no limit data cached — run Codex once")
                 .font(.system(size: 9)).foregroundColor(.dimmer).padding(.leading, 12)
         }
-        // Claude — real usage from /usage endpoint when available, else est. vs cap
+    }
+
+    @ViewBuilder
+    func claudeLimits(_ s: Stats) -> some View {
         let real = s.claude.real_limits
         let live = real?.ok == true
         HStack(spacing: 6) {
