@@ -755,10 +755,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 panel.setFrameOrigin(NSPoint(x: vf.maxX - rect.width - 24, y: vf.maxY - rect.height - 24))
             }
         }
-        // visible resize grip pinned to bottom-right
-        let grip = ResizeGrip(frame: NSRect(x: rect.width - 18, y: 0, width: 18, height: 18))
-        grip.autoresizingMask = [.minXMargin, .maxYMargin]
+        // visible resize grip pinned flush to the bottom-right corner
+        let grip = ResizeGrip(frame: .zero)
+        grip.translatesAutoresizingMaskIntoConstraints = false
         blur.addSubview(grip)
+        NSLayoutConstraint.activate([
+            grip.widthAnchor.constraint(equalToConstant: 16),
+            grip.heightAnchor.constraint(equalToConstant: 16),
+            grip.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -4),
+            grip.bottomAnchor.constraint(equalTo: blur.bottomAnchor, constant: -4),
+        ])
 
         panel.orderFrontRegardless()
         panel.invalidateShadow()
