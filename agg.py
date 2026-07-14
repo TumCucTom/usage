@@ -35,7 +35,7 @@ LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if us
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 10
+CACHE_VERSION = 11
 
 
 # ---------- helpers ----------
@@ -127,7 +127,7 @@ def parse_claude_file(path, now):
                 dd = days.setdefault(day, {})
                 add4(dd, model, (it, ot, cc, cr))
                 if ep >= horizon:
-                    recent.append([ep, model, it + ot + cc + cr])
+                    recent.append([ep, model, it + ot + cc + cr, it + ot])
     except Exception:
         return None
     return {
@@ -187,7 +187,7 @@ def parse_codex_file(path, now):
                         out = tot - it if tot > it else ot   # exact output, avoids reasoning double-count
                         add4(dd, model, (nc_in, out, 0, cin))
                         if ep >= horizon:
-                            recent.append([ep, model, tot])
+                            recent.append([ep, model, tot, max(0, tot - cin)])
                     rl = p.get("rate_limits")
                     if isinstance(rl, dict) and ep and ep >= now - RATE_RECENCY:
                         for slot in ("primary", "secondary"):
@@ -252,6 +252,11 @@ def total_of(b):
     return b["input"] + b["output"] + b["cache_creation"] + b["cache_read"]
 
 
+def nocache_of(b):
+    # generation tokens only (input + output), excluding cache
+    return b["input"] + b["output"]
+
+
 def agg_provider(contribs, now):
     today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
     life = blank()
@@ -262,6 +267,7 @@ def agg_provider(contribs, now):
     sessions = set()
     live = 0
     w5h = w24h = w7d = 0
+    w5h_nc = w24h_nc = w7d_nc = 0
     cut5 = now - 5 * 3600
     cut24 = now - 24 * 3600
     cut7 = now - 7 * 86400
@@ -271,37 +277,46 @@ def agg_provider(contribs, now):
         if c["last_activity"] and c["last_activity"] >= now - LIVE_WINDOW:
             live += 1
         proj_total = 0
+        proj_nc = 0
         for day, models in c["days"].items():
             for model, v in models.items():
                 tot = v[0] + v[1] + v[2] + v[3]   # all tokens incl cache
+                nc = v[0] + v[1]                  # non-cache (input+output)
                 life["input"] += v[0]; life["output"] += v[1]
                 life["cache_creation"] += v[2]; life["cache_read"] += v[3]
                 by_model[model] = by_model.get(model, 0) + tot
                 proj_total += tot
+                proj_nc += nc
                 if day == today:
                     day_today["input"] += v[0]; day_today["output"] += v[1]
                     day_today["cache_creation"] += v[2]; day_today["cache_read"] += v[3]
         by_project[c["project"]] = by_project.get(c["project"], 0) + proj_total
         if c.get("named"):   # only sessions with a real --resume name
             lbl = c["session_label"]
-            ni = named_info.setdefault(lbl, {"tokens": 0, "last": 0.0, "paths": []})
+            ni = named_info.setdefault(lbl, {"tokens": 0, "tokens_nc": 0, "last": 0.0, "paths": []})
             ni["tokens"] += proj_total
+            ni["tokens_nc"] += proj_nc
             ni["last"] = max(ni["last"], c["last_activity"] or 0.0)
             if c.get("path"):
                 ni["paths"].append(c["path"])
-        for ep, model, tot in c["recent"]:
+        for ev in c["recent"]:
+            ep, tot = ev[0], ev[2]
+            nc = ev[3] if len(ev) > 3 else tot
             if ep >= cut7:
-                w7d += tot
+                w7d += tot; w7d_nc += nc
                 if ep >= cut24:
-                    w24h += tot
+                    w24h += tot; w24h_nc += nc
                     if ep >= cut5:
-                        w5h += tot
+                        w5h += tot; w5h_nc += nc
     return {
         "lifetime": life,
         "lifetime_total": total_of(life),
+        "lifetime_nc": nocache_of(life),
         "today": day_today,
         "today_total": total_of(day_today),
+        "today_nc": nocache_of(day_today),
         "w5h": w5h, "w24h": w24h, "w7d": w7d,
+        "w5h_nc": w5h_nc, "w24h_nc": w24h_nc, "w7d_nc": w7d_nc,
         "by_model": by_model,
         "by_project": by_project,
         "named_info": named_info,
@@ -659,6 +674,11 @@ def main():
         "w5h": claude["w5h"] + codex["w5h"],
         "w24h": claude["w24h"] + codex["w24h"],
         "w7d": claude["w7d"] + codex["w7d"],
+        "lifetime_nc": claude["lifetime_nc"] + codex["lifetime_nc"],
+        "today_nc": claude["today_nc"] + codex["today_nc"],
+        "w5h_nc": claude["w5h_nc"] + codex["w5h_nc"],
+        "w24h_nc": claude["w24h_nc"] + codex["w24h_nc"],
+        "w7d_nc": claude["w7d_nc"] + codex["w7d_nc"],
         "sessions": claude["sessions"] + codex["sessions"],
         "live": claude["live"] + codex["live"],
         "cache_read": claude["lifetime"]["cache_read"] + codex["lifetime"]["cache_read"],
@@ -672,8 +692,9 @@ def main():
     named_all = {}
     for src in (claude, codex):
         for k, v in src["named_info"].items():
-            e = named_all.setdefault(k, {"tokens": 0, "last": 0.0, "paths": []})
+            e = named_all.setdefault(k, {"tokens": 0, "tokens_nc": 0, "last": 0.0, "paths": []})
             e["tokens"] += v["tokens"]
+            e["tokens_nc"] += v.get("tokens_nc", 0)
             e["last"] = max(e["last"], v["last"])
             e["paths"].extend(v.get("paths", []))
     named_sessions = []
@@ -684,8 +705,8 @@ def main():
                 or any(p in open_files for p in v["paths"])
                 or v["last"] >= now - LIVE_TOLERANCE)
         named_sessions.append({
-            "name": k, "tokens": v["tokens"], "last_activity": v["last"],
-            "running": running, "live": live,
+            "name": k, "tokens": v["tokens"], "tokens_nc": v["tokens_nc"],
+            "last_activity": v["last"], "running": running, "live": live,
         })
     # keep the 50 most recent so all three UI views (usage/live/recent) have data
     named_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
@@ -701,7 +722,9 @@ def main():
     out = {
         "generated_at": now,
         "claude": {
-            **{k: claude[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d", "sessions", "live")},
+            **{k: claude[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d",
+                                      "lifetime_nc", "today_nc", "w5h_nc", "w24h_nc", "w7d_nc",
+                                      "sessions", "live")},
             "lifetime_breakdown": claude["lifetime"],
             "top_models": top_n(claude["by_model"]),
             "top_projects": top_n(claude["by_project"]),
@@ -714,7 +737,9 @@ def main():
             "real_limits": claude_usage(),
         },
         "codex": {
-            **{k: codex[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d", "sessions", "live")},
+            **{k: codex[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d",
+                                     "lifetime_nc", "today_nc", "w5h_nc", "w24h_nc", "w7d_nc",
+                                     "sessions", "live")},
             "lifetime_breakdown": codex["lifetime"],
             "top_models": top_n(codex["by_model"]),
             "top_projects": top_n(codex["by_project"]),

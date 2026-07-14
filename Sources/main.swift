@@ -12,6 +12,7 @@ struct NameTokens: Decodable, Identifiable {
 struct NamedSession: Decodable, Identifiable {
     let name: String
     let tokens: Int
+    var tokens_nc: Int = 0
     let last_activity: Double
     let running: Bool
     var live: Bool = false
@@ -79,6 +80,7 @@ struct Provider: Decodable {
     let w7d: Int
     let sessions: Int
     let live: Int
+    var today_nc: Int = 0
     var lifetime_breakdown: Breakdown? = nil
     var top_models: [NameTokens] = []
     var top_projects: [NameTokens] = []
@@ -96,6 +98,9 @@ struct Combined: Decodable {
     let sessions: Int
     let live: Int
     var cache_read: Int = 0
+    var lifetime_nc: Int = 0
+    var today_nc: Int = 0
+    var w7d_nc: Int = 0
 }
 
 struct LiveSlot: Decodable {
@@ -174,12 +179,18 @@ final class OverlayModel: ObservableObject {
     @Published var error: String?
     @Published var memHistory: [MemSample] = []
     @Published var horizontal: Bool = UserDefaults.standard.bool(forKey: "ccstat.horizontal")
+    @Published var showCache: Bool = (UserDefaults.standard.object(forKey: "ccstat.showCache") as? Bool) ?? true
     var onLayout: (() -> Void)?
 
     func toggleLayout() {
         horizontal.toggle()
         UserDefaults.standard.set(horizontal, forKey: "ccstat.horizontal")
         onLayout?()
+    }
+
+    func toggleCache() {
+        showCache.toggle()
+        UserDefaults.standard.set(showCache, forKey: "ccstat.showCache")
     }
 
     private var timer: Timer?
@@ -427,6 +438,17 @@ struct OverlayView: View {
                 Text(fmtAgo(s.generated_at))
                     .font(.system(size: 9)).foregroundColor(.dimmer)
             }
+            Button(action: { model.toggleCache() }) {
+                Text("cache").font(.system(size: 8, weight: .bold))
+                    .foregroundColor(model.showCache ? .white : .dim)
+                    .padding(.horizontal, 5).padding(.vertical, 1.5)
+                    .background(
+                        Capsule().fill(model.showCache ? Color.white.opacity(0.18) : Color.clear)
+                            .overlay(Capsule().stroke(Color.white.opacity(0.18),
+                                                      lineWidth: model.showCache ? 0 : 1)))
+            }
+            .buttonStyle(.plain)
+            .help("Include cache tokens in counts")
             Button(action: { model.toggleLayout() }) {
                 Image(systemName: model.horizontal ? "rectangle.split.1x2" : "rectangle.split.3x1")
                     .font(.system(size: 11, weight: .bold))
@@ -558,37 +580,42 @@ struct OverlayView: View {
             .frame(width: 46, alignment: .trailing)
     }
 
+    // pick the cache-inclusive or non-cache value based on the toggle
+    func tok(_ withCache: Int, _ noCache: Int) -> Int { model.showCache ? withCache : noCache }
+
+    var cacheNote: String { model.showCache
+        ? "incl \(fmtTokens(model.stats?.combined.cache_read ?? 0)) cache"
+        : "cache excluded" }
+
     // Combined + split totals --------------------------------------------
     @ViewBuilder
     func totalsSection(_ s: Stats) -> some View {
         HStack(spacing: 10) {
-            bigTotal("TODAY", s.combined.today_total, .white)
-            bigTotal("WEEK", s.combined.w7d, .white.opacity(0.9))
-            bigTotal("LIFETIME", s.combined.lifetime_total, .white.opacity(0.8))
+            bigTotal("TODAY", tok(s.combined.today_total, s.combined.today_nc), .white)
+            bigTotal("WEEK", tok(s.combined.w7d, s.combined.w7d_nc), .white.opacity(0.9))
+            bigTotal("LIFETIME", tok(s.combined.lifetime_total, s.combined.lifetime_nc), .white.opacity(0.8))
         }
         HStack(spacing: 6) {
-            splitPill("Claude", .claudeAccent, s.claude.today_total)
-            splitPill("Codex", .codexAccent, s.codex.today_total)
+            splitPill("Claude", .claudeAccent, tok(s.claude.today_total, s.claude.today_nc))
+            splitPill("Codex", .codexAccent, tok(s.codex.today_total, s.codex.today_nc))
             Spacer()
-            Text("incl. \(fmtTokens(s.combined.cache_read)) cache")
-                .font(.system(size: 8)).foregroundColor(.dimmer)
+            Text(cacheNote).font(.system(size: 8)).foregroundColor(.dimmer)
         }
     }
 
     @ViewBuilder
     func totalsCompact(_ s: Stats) -> some View {
         SectionLabel(text: "Tokens")
-        compactTotal("TODAY", s.combined.today_total)
-        compactTotal("WEEK", s.combined.w7d)
-        compactTotal("LIFE", s.combined.lifetime_total)
+        compactTotal("TODAY", tok(s.combined.today_total, s.combined.today_nc))
+        compactTotal("WEEK", tok(s.combined.w7d, s.combined.w7d_nc))
+        compactTotal("LIFE", tok(s.combined.lifetime_total, s.combined.lifetime_nc))
         HStack(spacing: 5) {
             Circle().fill(Color.claudeAccent).frame(width: 5, height: 5)
-            Text(fmtTokens(s.claude.today_total)).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
+            Text(fmtTokens(tok(s.claude.today_total, s.claude.today_nc))).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
             Circle().fill(Color.codexAccent).frame(width: 5, height: 5)
-            Text(fmtTokens(s.codex.today_total)).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
+            Text(fmtTokens(tok(s.codex.today_total, s.codex.today_nc))).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
         }
-        Text("incl \(fmtTokens(s.combined.cache_read)) cache")
-            .font(.system(size: 8)).foregroundColor(.dimmer)
+        Text(cacheNote).font(.system(size: 8)).foregroundColor(.dimmer)
     }
 
     func compactTotal(_ label: String, _ v: Int) -> some View {
@@ -635,15 +662,16 @@ struct OverlayView: View {
             Text(sessView == .current ? "none running" : "no named sessions yet")
                 .font(.system(size: 9)).foregroundColor(.dimmer)
         }
-        let maxTok = max(1, list.map { $0.tokens }.max() ?? 1)
+        let maxTok = max(1, list.map { tok($0.tokens, $0.tokens_nc) }.max() ?? 1)
         ForEach(list.prefix(model.horizontal ? 3 : 4)) { sess in
+            let sTok = tok(sess.tokens, sess.tokens_nc)
             HStack(spacing: 7) {
                 Circle().fill(sess.running ? Color.liveGreen : (sess.live ? Color.dim : Color.clear))
                     .frame(width: 5, height: 5)
                 Text(sess.name).font(.system(size: 10)).foregroundColor(.white.opacity(0.78))
                     .frame(width: 104, alignment: .leading).lineLimit(1).truncationMode(.middle)
-                MeterBar(fraction: Double(sess.tokens) / Double(maxTok), color: .white.opacity(0.35), height: 4)
-                Text(sessView == .usage ? fmtTokens(sess.tokens) : agoShort(sess.last_activity))
+                MeterBar(fraction: Double(sTok) / Double(maxTok), color: .white.opacity(0.35), height: 4)
+                Text(sessView == .usage ? fmtTokens(sTok) : agoShort(sess.last_activity))
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundColor(.dim).frame(width: 44, alignment: .trailing)
             }
