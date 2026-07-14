@@ -20,6 +20,18 @@ struct NamedSession: Decodable, Identifiable {
 
 enum SessView { case usage, current, recent }
 
+struct Memory: Decodable {
+    let physical: Double
+    let used: Double
+    let cached: Double
+    let swap: Double
+    let app: Double
+    let wired: Double
+    let compressed: Double
+    let pressure_pct: Double
+    let level: String
+}
+
 struct LimitWindow: Decodable {
     let used_percent: Double?
     let resets_at: Double?
@@ -104,6 +116,7 @@ struct Stats: Decodable {
     let top_projects: [NameTokens]
     var named_sessions: [NamedSession] = []
     var live_sessions: LiveSessions? = nil
+    var memory: Memory? = nil
 }
 
 // MARK: - Formatting helpers
@@ -154,6 +167,7 @@ final class OverlayModel: ObservableObject {
     @Published var stats: Stats?
     @Published var refreshing = false
     @Published var error: String?
+    @Published var memHistory: [Double] = []
 
     private var timer: Timer?
 
@@ -183,6 +197,10 @@ final class OverlayModel: ObservableObject {
             let s = try JSONDecoder().decode(Stats.self, from: data)
             self.stats = s
             self.error = nil
+            if let m = s.memory {
+                memHistory.append(m.pressure_pct)
+                if memHistory.count > 60 { memHistory.removeFirst(memHistory.count - 60) }
+            }
         } catch {
             self.error = "parse error"
         }
@@ -227,6 +245,54 @@ struct MeterBar: View {
     }
 }
 
+struct MemSparkline: View {
+    let history: [Double]
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            content(Array(history.suffix(60)), geo.size)
+        }
+        .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.05)))
+    }
+
+    @ViewBuilder
+    func content(_ pts: [Double], _ size: CGSize) -> some View {
+        if pts.count > 1 {
+            ZStack {
+                areaPath(pts, size).fill(color.opacity(0.32))
+                linePath(pts, size).stroke(color, lineWidth: 1.2)
+            }
+        } else {
+            Text("collecting…").font(.system(size: 8)).foregroundColor(.dimmer)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func point(_ i: Int, _ v: Double, _ n: Int, _ size: CGSize) -> CGPoint {
+        let x = CGFloat(i) / CGFloat(max(1, n)) * size.width
+        let y = size.height - CGFloat(min(1.0, max(0, v / 100.0))) * (size.height - 2) - 1
+        return CGPoint(x: x, y: y)
+    }
+
+    private func areaPath(_ pts: [Double], _ size: CGSize) -> Path {
+        var p = Path(); let n = pts.count - 1
+        p.move(to: CGPoint(x: 0, y: size.height))
+        for (i, v) in pts.enumerated() { p.addLine(to: point(i, v, n, size)) }
+        p.addLine(to: CGPoint(x: size.width, y: size.height))
+        p.closeSubpath(); return p
+    }
+
+    private func linePath(_ pts: [Double], _ size: CGSize) -> Path {
+        var p = Path(); let n = pts.count - 1
+        for (i, v) in pts.enumerated() {
+            let pt = point(i, v, n, size)
+            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+        }
+        return p
+    }
+}
+
 struct SectionLabel: View {
     let text: String
     var accent: Color = .dim
@@ -256,6 +322,10 @@ struct OverlayView: View {
                 Divider().overlay(Color.white.opacity(0.08))
                 whereSection(s)
                 footer(s)
+                if let m = s.memory {
+                    Divider().overlay(Color.white.opacity(0.08))
+                    memorySection(m)
+                }
             } else {
                 Text(model.error ?? "Loading…")
                     .font(.system(size: 11)).foregroundColor(.dim)
@@ -501,6 +571,54 @@ struct OverlayView: View {
         return "\(h / 24)d"
     }
 
+    // Memory (Activity Monitor-style) --------------------------------------
+    func pressureColor(_ level: String) -> Color {
+        switch level {
+        case "warning": return Color(red: 0.95, green: 0.77, blue: 0.22)
+        case "critical": return Color(red: 0.92, green: 0.30, blue: 0.28)
+        default: return .liveGreen
+        }
+    }
+
+    func fmtGB(_ bytes: Double) -> String {
+        String(format: "%.2f GB", bytes / 1073741824)
+    }
+
+    @ViewBuilder
+    func memorySection(_ m: Memory) -> some View {
+        HStack {
+            SectionLabel(text: "Memory pressure")
+            Spacer()
+            Text(m.level.uppercased())
+                .font(.system(size: 8, weight: .bold)).tracking(0.5)
+                .foregroundColor(pressureColor(m.level))
+        }
+        MemSparkline(history: model.memHistory, color: pressureColor(m.level))
+            .frame(height: 26)
+        HStack(alignment: .top, spacing: 16) {
+            VStack(spacing: 2) {
+                memRow("Physical", m.physical)
+                memRow("Used", m.used)
+                memRow("Cached", m.cached)
+                memRow("Swap", m.swap)
+            }
+            VStack(spacing: 2) {
+                memRow("App", m.app)
+                memRow("Wired", m.wired)
+                memRow("Compressed", m.compressed)
+            }
+        }
+    }
+
+    func memRow(_ label: String, _ bytes: Double) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.system(size: 9)).foregroundColor(.dim)
+            Spacer(minLength: 4)
+            Text(fmtGB(bytes)).font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundColor(.white.opacity(0.82))
+        }
+    }
+
     func footer(_ s: Stats) -> some View {
         let ls = s.live_sessions
         return VStack(alignment: .leading, spacing: 3) {
@@ -644,6 +762,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         panel.orderFrontRegardless()
         panel.invalidateShadow()
+        // grow to fit content (top-left anchored) so nothing clips after adding sections
+        DispatchQueue.main.async { [weak panel] in
+            guard let panel = panel else { return }
+            let fit = hosting.fittingSize
+            if fit.height > 10 && panel.frame.height < fit.height {
+                var f = panel.frame
+                let top = f.maxY
+                f.size.height = fit.height
+                f.origin.y = top - fit.height
+                panel.setFrame(f, display: true)
+                panel.invalidateShadow()
+            }
+        }
         model.start()
         // keep it at the forefront even if another app raises a high-level window
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in

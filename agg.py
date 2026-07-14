@@ -416,6 +416,44 @@ def claude_usage():
     return {"five_h": fh, "weekly": sd, "fable": fable, "ok": True}
 
 
+def memory_stats():
+    """macOS memory breakdown (Activity Monitor-style), values in bytes."""
+    import re
+    def sh(c):
+        try:
+            return subprocess.run(c, capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return ""
+    try:
+        pagesize = int(sh(["sysctl", "-n", "hw.pagesize"]) or 16384)
+        physical = int(sh(["sysctl", "-n", "hw.memsize"]) or 0)
+    except Exception:
+        return None
+    if not physical:
+        return None
+    vm = sh(["vm_stat"])
+    def pages(label):
+        m = re.search(re.escape(label) + r':\s+(\d+)\.', vm)
+        return int(m.group(1)) if m else 0
+    wired = pages("Pages wired down") * pagesize
+    comp = pages("Pages occupied by compressor") * pagesize
+    anon = pages("Anonymous pages") * pagesize
+    purg = pages("Pages purgeable") * pagesize
+    fileb = pages("File-backed pages") * pagesize
+    app = max(0, anon - purg)
+    cached = fileb + purg
+    used = app + wired + comp
+    swu = 0.0
+    m = re.search(r'used = ([0-9.]+)([KMG])', sh(["sysctl", "-n", "vm.swapusage"]))
+    if m:
+        swu = float(m.group(1)) * {"K": 1024, "M": 1024**2, "G": 1024**3}[m.group(2)]
+    lvl = sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip()
+    level = {"1": "normal", "2": "warning", "4": "critical"}.get(lvl, "normal")
+    return {"physical": physical, "used": used, "cached": cached, "swap": swu,
+            "app": app, "wired": wired, "compressed": comp,
+            "pressure_pct": round(100.0 * (wired + comp) / physical, 1), "level": level}
+
+
 def running_resume_names():
     """Names currently open via `claude --resume <name>` processes."""
     try:
@@ -645,6 +683,7 @@ def main():
         "top_projects": top_n(by_project_all, 5),
         "named_sessions": named_sessions,
         "live_sessions": live_sessions,
+        "memory": memory_stats(),
     }
 
     tmp = STATS_PATH + ".tmp"
