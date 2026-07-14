@@ -43,6 +43,7 @@ struct LimitsPct: Decodable {
 struct RealLimits: Decodable {
     let five_h: LimitWindow?
     let weekly: LimitWindow?
+    var fable: LimitWindow? = nil
     let ok: Bool
 }
 
@@ -340,6 +341,7 @@ struct OverlayView: View {
         if live, let r = real {
             limitRow("5h", r.five_h, .claudeAccent)
             limitRow("Week", r.weekly, .claudeAccent)
+            limitRow("Fable", r.fable, .claudeAccent)
         } else if let lp = s.claude.limits_pct {
             pctRow("5h", lp.five_h, .claudeAccent)
             pctRow("Week", lp.weekly, .claudeAccent)

@@ -25,6 +25,7 @@ STATS_PATH = os.path.join(SUPPORT, "stats.json")
 RECENT_RETAIN = 10 * 86400   # keep per-event points for 10 days (covers 7d window + margin)
 LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
 ACTIVE_SECS = 120            # a session counts as "running" (actively generating) if written this recently
+RUNNING_SECS = 60            # tighter window for the open/running/idle footer split
 LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if used within this window
 
 # Claude Code does NOT expose rate-limit percentages locally, so Claude usage %
@@ -387,7 +388,16 @@ def claude_usage():
     fh, sd = win(d.get("five_hour")), win(d.get("seven_day"))
     if fh is None and sd is None:
         return None
-    return {"five_h": fh, "weekly": sd, "ok": True}
+    # per-model scoped weekly limit for Fable, from the limits[] array
+    fable = None
+    for lm in d.get("limits") or []:
+        sc = lm.get("scope") or {}
+        mdl = sc.get("model") or {} if isinstance(sc, dict) else {}
+        if isinstance(mdl, dict) and (mdl.get("display_name") or "").lower() == "fable":
+            fable = {"used_percent": round(float(lm.get("percent") or 0), 1),
+                     "resets_at": parse_ts(lm.get("resets_at"))}
+            break
+    return {"five_h": fh, "weekly": sd, "fable": fable, "ok": True}
 
 
 def running_resume_names():
@@ -441,9 +451,84 @@ def count_recent_files(files, now, secs):
     return n
 
 
-def live_split(open_n, recent_n):
-    running = min(open_n, recent_n)
-    return {"open": open_n, "running": running, "idle": max(0, open_n - running)}
+def _pid_cwd(pid):
+    try:
+        o = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+                           capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return None
+    for ln in o.splitlines():
+        if ln.startswith("n"):
+            return ln[1:]
+    return None
+
+
+def _recent_in_dir(cwd, now):
+    """How many transcripts in the project dir for `cwd` were written recently."""
+    if not cwd:
+        return 0
+    d = os.path.join(CLAUDE_DIR, cwd.replace("/", "-").replace(".", "-"))
+    cut = now - RUNNING_SECS
+    n = 0
+    for f in glob.glob(os.path.join(d, "*.jsonl")):
+        try:
+            if os.stat(f).st_mtime >= cut:
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def live_session_counts(now, open_files):
+    """Accurate open/running/idle for interactive CLI sessions.
+    Claude: group open PIDs by cwd, running = min(#pids, #recent transcripts) per dir
+    (handles many sessions sharing one directory). Codex: each PID holds its own
+    transcript open, so running = recent among those."""
+    SKIP = ("bg-pty-host", "bg-spare", "daemon", "--bg", "bg-host",
+            "Claude.app", "CCStat", "mcp", "--type=")
+    try:
+        out = subprocess.run(["ps", "-axo", "pid,command"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return None
+    claude_pids, codex_pids = [], []
+    for line in out.splitlines()[1:]:
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid, cmd = parts[0], parts[1]
+        if cmd == "claude" or cmd.startswith("claude "):
+            if not any(k in cmd for k in SKIP):
+                claude_pids.append(pid)
+        elif cmd.strip() == "codex":
+            codex_pids.append(pid)
+
+    cwd_pids = {}
+    for pid in claude_pids:
+        cwd = _pid_cwd(pid) or ""
+        cwd_pids[cwd] = cwd_pids.get(cwd, 0) + 1
+    c_run = 0
+    for cwd, npids in cwd_pids.items():
+        c_run += min(npids, _recent_in_dir(cwd, now))
+    c_open = len(claude_pids)
+    c = {"open": c_open, "running": c_run, "idle": max(0, c_open - c_run)}
+
+    x_recent = 0
+    cut = now - RUNNING_SECS
+    for f in open_files:
+        if "/.codex/sessions/" in f:
+            try:
+                if os.stat(f).st_mtime >= cut:
+                    x_recent += 1
+            except OSError:
+                pass
+    x_open = len(codex_pids)
+    x_run = min(x_open, x_recent)
+    x = {"open": x_open, "running": x_run, "idle": max(0, x_open - x_run)}
+
+    return {"claude": c, "codex": x,
+            "open": c["open"] + x["open"], "running": c["running"] + x["running"],
+            "idle": c["idle"] + x["idle"], "avail": True}
 
 
 # ---------- main ----------
@@ -511,18 +596,11 @@ def main():
     named_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
     named_sessions = named_sessions[:50]
 
-    # live / open sessions (running vs idle) from process + recent-write inspection
-    proc = count_open_sessions()
-    rc = count_recent_files(claude_files, now, ACTIVE_SECS)
-    rx = count_recent_files(codex_files, now, ACTIVE_SECS)
-    c_live = live_split(proc["claude_open"], rc)
-    x_live = live_split(proc["codex_open"], rx)
-    live_sessions = {
-        "claude": c_live, "codex": x_live,
-        "open": c_live["open"] + x_live["open"],
-        "running": c_live["running"] + x_live["running"],
-        "idle": c_live["idle"] + x_live["idle"],
-        "avail": proc["avail"],
+    # live / open sessions (running vs idle) — per-process, mapped to transcripts
+    live_sessions = live_session_counts(now, open_files) or {
+        "claude": {"open": 0, "running": 0, "idle": 0},
+        "codex": {"open": 0, "running": 0, "idle": 0},
+        "open": 0, "running": 0, "idle": 0, "avail": False,
     }
 
     out = {
