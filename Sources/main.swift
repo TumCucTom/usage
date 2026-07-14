@@ -422,11 +422,15 @@ struct OverlayView: View {
     @ViewBuilder
     func whereSection(_ s: Stats) -> some View {
         HStack {
-            SectionLabel(text: "Top sessions")
+            SectionLabel(text: "Named sessions")
             Spacer()
-            Text("project·id").font(.system(size: 8)).foregroundColor(.dimmer)
+            Text("--resume name · Claude").font(.system(size: 8)).foregroundColor(.dimmer)
         }
         let top = s.top_sessions.prefix(4)
+        if top.isEmpty {
+            Text("no named sessions yet")
+                .font(.system(size: 9)).foregroundColor(.dimmer)
+        }
         let maxTok = max(1, top.first?.tokens ?? 1)
         ForEach(Array(top)) { sess in
             HStack(spacing: 8) {

@@ -32,7 +32,7 @@ ACTIVE_SECS = 120            # a session counts as "running" if its transcript w
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 
 
 # ---------- helpers ----------
@@ -83,11 +83,11 @@ def parse_claude_file(path, now):
     try:
         with open(path, "r", errors="ignore") as fh:
             for line in fh:
-                # capture a human session title if the user named/renamed it
-                if '"custom-title"' in line or '"agent-name"' in line or '"type":"summary"' in line:
+                # capture the real --resume name the user gave (custom-title)
+                if '"custom-title"' in line or '"agent-name"' in line:
                     try:
                         j = json.loads(line)
-                        t = j.get("customTitle") or j.get("summary") or j.get("agentName")
+                        t = j.get("customTitle") or j.get("agentName")
                         if t:
                             title = t.strip()
                     except Exception:
@@ -129,6 +129,7 @@ def parse_claude_file(path, now):
         return None
     return {
         "provider": "claude", "project": proj,
+        "named": title is not None,
         "session_label": title if title else (proj + "·" + os.path.basename(path)[:6]),
         "sessions": sorted(sessions), "last_activity": last_activity,
         "days": days, "recent": recent,
@@ -146,20 +147,9 @@ def parse_codex_file(path, now):
     model = "codex"
     rate = None
     rate_ts = None
-    title = None
     try:
         with open(path, "r", errors="ignore") as fh:
             for line in fh:
-                if title is None and '"user_message"' in line:
-                    try:
-                        pl = json.loads(line).get("payload", {})
-                        m = pl.get("message") or pl.get("text") or pl.get("content")
-                        if isinstance(m, list):
-                            m = " ".join(x.get("text", "") for x in m if isinstance(x, dict))
-                        if m and not str(m).lstrip().startswith("<"):
-                            title = " ".join(str(m).split())[:46]
-                    except Exception:
-                        pass
                 if ('token_count' not in line and '"cwd"' not in line
                         and '"model"' not in line):
                     continue
@@ -206,7 +196,8 @@ def parse_codex_file(path, now):
         sid = os.path.basename(path)
     return {
         "provider": "codex", "project": proj,
-        "session_label": title if title else (proj + "·" + str(sid)[:6]),
+        "named": False,   # Codex has no user-given --resume session names
+        "session_label": proj + "·" + str(sid)[:6],
         "sessions": [sid], "last_activity": last_activity,
         "days": days, "recent": recent,
         "codex_rate": rate, "codex_rate_ts": rate_ts,
@@ -276,8 +267,9 @@ def agg_provider(contribs, now):
                     day_today["input"] += v[0]; day_today["output"] += v[1]
                     day_today["cache_creation"] += v[2]; day_today["cache_read"] += v[3]
         by_project[c["project"]] = by_project.get(c["project"], 0) + proj_total
-        lbl = c.get("session_label") or c["project"]
-        by_session[lbl] = by_session.get(lbl, 0) + proj_total
+        if c.get("named"):   # only sessions with a real --resume name
+            lbl = c["session_label"]
+            by_session[lbl] = by_session.get(lbl, 0) + proj_total
         for ep, model, tot in c["recent"]:
             if ep >= cut7:
                 w7d += tot
