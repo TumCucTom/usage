@@ -20,6 +20,11 @@ struct NamedSession: Decodable, Identifiable {
 
 enum SessView { case usage, current, recent }
 
+struct MemSample {
+    let v: Double     // pressure %
+    let level: Int    // 1 normal, 2 warning, 4 critical (kern.memorystatus_vm_pressure_level)
+}
+
 struct Memory: Decodable {
     let physical: Double
     let used: Double
@@ -167,7 +172,7 @@ final class OverlayModel: ObservableObject {
     @Published var stats: Stats?
     @Published var refreshing = false
     @Published var error: String?
-    @Published var memHistory: [Double] = []
+    @Published var memHistory: [MemSample] = []
     @Published var horizontal: Bool = UserDefaults.standard.bool(forKey: "ccstat.horizontal")
     var onLayout: (() -> Void)?
 
@@ -199,6 +204,13 @@ final class OverlayModel: ObservableObject {
         return 100.0 * (wired + compressed) / physical
     }
 
+    func currentPressureLevel() -> Int {
+        var lvl: Int32 = 1
+        var size = MemoryLayout<Int32>.size
+        sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &size, nil, 0)
+        return Int(lvl)
+    }
+
     var statsURL: URL {
         let base = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/CCStat")
@@ -220,7 +232,7 @@ final class OverlayModel: ObservableObject {
         // high-fidelity memory-pressure sampling (every 2s)
         memTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self = self, let p = self.currentPressurePct() else { return }
-            self.memHistory.append(p)
+            self.memHistory.append(MemSample(v: p, level: self.currentPressureLevel()))
             if self.memHistory.count > 150 { self.memHistory.removeFirst(self.memHistory.count - 150) }
         }
     }
@@ -275,23 +287,32 @@ struct MeterBar: View {
     }
 }
 
+func pressureLevelColor(_ level: Int) -> Color {
+    switch level {
+    case 4: return Color(red: 0.92, green: 0.30, blue: 0.28)   // critical
+    case 2: return Color(red: 0.95, green: 0.77, blue: 0.22)   // warning
+    default: return .liveGreen                                  // normal
+    }
+}
+
 struct MemSparkline: View {
-    let history: [Double]
-    let color: Color
+    let history: [MemSample]
 
     var body: some View {
         GeometryReader { geo in
-            content(Array(history.suffix(60)), geo.size)
+            content(Array(history.suffix(150)), geo.size)
         }
         .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.05)))
     }
 
     @ViewBuilder
-    func content(_ pts: [Double], _ size: CGSize) -> some View {
+    func content(_ pts: [MemSample], _ size: CGSize) -> some View {
         if pts.count > 1 {
             ZStack {
-                areaPath(pts, size).fill(color.opacity(0.32))
-                linePath(pts, size).stroke(color, lineWidth: 1.2)
+                // one filled area per level so historical bands keep their color
+                ForEach([1, 2, 4], id: \.self) { lvl in
+                    areaFor(pts, lvl, size).fill(pressureLevelColor(lvl).opacity(0.45))
+                }
             }
         } else {
             Text("collecting…").font(.system(size: 8)).foregroundColor(.dimmer)
@@ -299,25 +320,19 @@ struct MemSparkline: View {
         }
     }
 
-    private func point(_ i: Int, _ v: Double, _ n: Int, _ size: CGSize) -> CGPoint {
-        let x = CGFloat(i) / CGFloat(max(1, n)) * size.width
-        let y = size.height - CGFloat(min(1.0, max(0, v / 100.0))) * (size.height - 2) - 1
-        return CGPoint(x: x, y: y)
-    }
+    private func xPos(_ i: Int, _ n: Int, _ w: CGFloat) -> CGFloat { CGFloat(i) / CGFloat(max(1, n)) * w }
+    private func yPos(_ v: Double, _ h: CGFloat) -> CGFloat { h - CGFloat(min(1.0, max(0, v / 100.0))) * (h - 2) - 1 }
 
-    private func areaPath(_ pts: [Double], _ size: CGSize) -> Path {
-        var p = Path(); let n = pts.count - 1
-        p.move(to: CGPoint(x: 0, y: size.height))
-        for (i, v) in pts.enumerated() { p.addLine(to: point(i, v, n, size)) }
-        p.addLine(to: CGPoint(x: size.width, y: size.height))
-        p.closeSubpath(); return p
-    }
-
-    private func linePath(_ pts: [Double], _ size: CGSize) -> Path {
-        var p = Path(); let n = pts.count - 1
-        for (i, v) in pts.enumerated() {
-            let pt = point(i, v, n, size)
-            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+    private func areaFor(_ pts: [MemSample], _ lvl: Int, _ size: CGSize) -> Path {
+        var p = Path()
+        let n = pts.count - 1
+        for i in 0..<n where pts[i].level == lvl {
+            let x0 = xPos(i, n, size.width), x1 = xPos(i + 1, n, size.width)
+            p.move(to: CGPoint(x: x0, y: size.height))
+            p.addLine(to: CGPoint(x: x0, y: yPos(pts[i].v, size.height)))
+            p.addLine(to: CGPoint(x: x1, y: yPos(pts[i + 1].v, size.height)))
+            p.addLine(to: CGPoint(x: x1, y: size.height))
+            p.closeSubpath()
         }
         return p
     }
@@ -677,14 +692,15 @@ struct OverlayView: View {
 
     @ViewBuilder
     func memorySection(_ m: Memory) -> some View {
+        let lvl = model.memHistory.last?.level ?? 1
         HStack {
             SectionLabel(text: "Memory pressure")
             Spacer()
-            Text(m.level.uppercased())
+            Text(lvl == 4 ? "CRITICAL" : lvl == 2 ? "WARNING" : "NORMAL")
                 .font(.system(size: 8, weight: .bold)).tracking(0.5)
-                .foregroundColor(pressureColor(m.level))
+                .foregroundColor(pressureLevelColor(lvl))
         }
-        MemSparkline(history: model.memHistory, color: pressureColor(m.level))
+        MemSparkline(history: model.memHistory)
             .frame(height: 26)
         HStack(alignment: .top, spacing: 16) {
             VStack(spacing: 2) {
