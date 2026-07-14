@@ -373,16 +373,55 @@ def count_open_sessions():
     return {"claude_open": claude_open, "codex_open": codex_open, "avail": True}
 
 
-def claude_usage():
-    """Fetch REAL Claude usage from the same endpoint /usage uses, authenticated
-    with the OAuth token in the login Keychain. Metadata endpoint — no token cost.
-    Returns {five_h, weekly, ok} or None if unavailable (offline / locked / expired)."""
+def _dbg(msg):
     try:
-        raw = subprocess.run(
+        with open(os.path.join(SUPPORT, "claude_debug.txt"), "w") as f:
+            f.write(str(msg))
+    except Exception:
+        pass
+
+
+USAGE_TTL = 900   # re-fetch /usage at most every 15 min; it's strict-rate-limited (Claude Code calls it on-demand, not on a timer)
+
+
+def claude_usage():
+    """Cached real Claude usage. Fetches /usage at most every USAGE_TTL seconds and
+    reuses the last good value on 429/offline (so the display never drops to the
+    estimate just because a poll was rate-limited)."""
+    cache_path = os.path.join(SUPPORT, "usage_cache.json")
+    cached = None
+    try:
+        cached = json.load(open(cache_path))
+    except Exception:
+        cached = None
+    now = time.time()
+    if cached and (now - cached.get("ts", 0)) < USAGE_TTL:
+        return cached.get("result")
+    result = _fetch_claude_usage()
+    prev = cached.get("result") if cached else None
+    to_store = result if result is not None else prev   # keep last good on failure
+    # always stamp ts so failed fetches are throttled too (don't re-trip the rate limit)
+    try:
+        json.dump({"ts": now, "result": to_store}, open(cache_path, "w"))
+    except Exception:
+        pass
+    return to_store
+
+
+def _fetch_claude_usage():
+    """Fetch REAL Claude usage from the same endpoint /usage uses, authenticated
+    with the OAuth token in the login Keychain. Metadata endpoint — no token cost."""
+    try:
+        r = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5).stdout
+            capture_output=True, text=True, timeout=5)
+        raw = r.stdout
+        if not raw.strip():
+            _dbg("no token stdout; rc=%s stderr=%s" % (r.returncode, r.stderr[:200]))
+            return None
         tok = (json.loads(raw).get("claudeAiOauth") or {}).get("accessToken")
         if not tok:
+            _dbg("token parse failed")
             return None
         import urllib.request
         req = urllib.request.Request(
@@ -392,7 +431,9 @@ def claude_usage():
                      "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             d = json.loads(resp.read().decode())
-    except Exception:
+        _dbg("OK")
+    except Exception as e:
+        _dbg("exception: %r" % e)
         return None
 
     def win(o):
