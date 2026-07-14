@@ -168,6 +168,14 @@ final class OverlayModel: ObservableObject {
     @Published var refreshing = false
     @Published var error: String?
     @Published var memHistory: [Double] = []
+    @Published var horizontal: Bool = UserDefaults.standard.bool(forKey: "ccstat.horizontal")
+    var onLayout: (() -> Void)?
+
+    func toggleLayout() {
+        horizontal.toggle()
+        UserDefaults.standard.set(horizontal, forKey: "ccstat.horizontal")
+        onLayout?()
+    }
 
     private var timer: Timer?
 
@@ -316,16 +324,7 @@ struct OverlayView: View {
         VStack(alignment: .leading, spacing: 11) {
             header
             if let s = model.stats {
-                limitsSection(s)
-                Divider().overlay(Color.white.opacity(0.08))
-                totalsSection(s)
-                Divider().overlay(Color.white.opacity(0.08))
-                whereSection(s)
-                footer(s)
-                if let m = s.memory {
-                    Divider().overlay(Color.white.opacity(0.08))
-                    memorySection(m)
-                }
+                if model.horizontal { horizontalContent(s) } else { verticalContent(s) }
             } else {
                 Text(model.error ?? "Loading…")
                     .font(.system(size: 11)).foregroundColor(.dim)
@@ -335,9 +334,46 @@ struct OverlayView: View {
             Spacer(minLength: 0)
         }
         .padding(14)
-        .frame(minWidth: 256, idealWidth: 296, maxWidth: 620,
+        .frame(minWidth: model.horizontal ? 640 : 256,
+               idealWidth: model.horizontal ? 840 : 296,
+               maxWidth: model.horizontal ? 1040 : 620,
                maxHeight: .infinity, alignment: .top)
         .onReceive(tick) { now = $0 }
+    }
+
+    @ViewBuilder
+    func verticalContent(_ s: Stats) -> some View {
+        limitsSection(s)
+        Divider().overlay(Color.white.opacity(0.08))
+        totalsSection(s)
+        Divider().overlay(Color.white.opacity(0.08))
+        whereSection(s)
+        footer(s)
+        if let m = s.memory {
+            Divider().overlay(Color.white.opacity(0.08))
+            memorySection(m)
+        }
+    }
+
+    @ViewBuilder
+    func horizontalContent(_ s: Stats) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) { limitsSection(s) }.frame(width: 188)
+            vDivider
+            VStack(alignment: .leading, spacing: 8) {
+                totalsSection(s)
+                whereSection(s)
+                footer(s)
+            }.frame(width: 214)
+            if let m = s.memory {
+                vDivider
+                VStack(alignment: .leading, spacing: 8) { memorySection(m) }.frame(width: 214)
+            }
+        }
+    }
+
+    var vDivider: some View {
+        Rectangle().fill(Color.white.opacity(0.08)).frame(width: 1)
     }
 
     // Header (drag handle) ------------------------------------------------
@@ -353,6 +389,13 @@ struct OverlayView: View {
                 Text(fmtAgo(s.generated_at))
                     .font(.system(size: 9)).foregroundColor(.dimmer)
             }
+            Button(action: { model.toggleLayout() }) {
+                Image(systemName: model.horizontal ? "rectangle.split.1x2" : "rectangle.split.3x1")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.white.opacity(0.75))
+            }
+            .buttonStyle(.plain)
+            .help("Toggle wide / tall layout")
             Button(action: { model.refresh() }) {
                 Image(systemName: model.refreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
                     .font(.system(size: 11, weight: .bold))
@@ -712,7 +755,23 @@ final class ClickThroughHostingView: NSHostingView<AnyView> {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: NSPanel!
+    var hostingView: NSView?
     let model = OverlayModel()
+
+    func fitToContent() {
+        guard let panel = panel, let hosting = hostingView else { return }
+        DispatchQueue.main.async {
+            hosting.layoutSubtreeIfNeeded()
+            let fit = hosting.fittingSize
+            guard fit.width > 10, fit.height > 10 else { return }
+            var f = panel.frame
+            let top = f.maxY
+            f.size = fit
+            f.origin.y = top - fit.height   // keep top-left anchored
+            panel.setFrame(f, display: true, animate: false)
+            panel.invalidateShadow()
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no dock icon, menu-bar-agent style
@@ -720,6 +779,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hosting = ClickThroughHostingView(
             rootView: AnyView(OverlayView().environmentObject(model)))
         hosting.translatesAutoresizingMaskIntoConstraints = false
+        self.hostingView = hosting
+        model.onLayout = { [weak self] in self?.fitToContent() }
 
         let blur = BlurHostView()
         blur.addSubview(hosting)
@@ -744,8 +805,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
-        panel.minSize = NSSize(width: 256, height: 240)
-        panel.maxSize = NSSize(width: 620, height: 1000)
+        panel.minSize = NSSize(width: 256, height: 200)
+        panel.maxSize = NSSize(width: 1040, height: 1200)
 
         // restore saved position or default to top-right
         panel.setFrameAutosaveName("CCStatOverlayPanel")
@@ -768,19 +829,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         panel.orderFrontRegardless()
         panel.invalidateShadow()
-        // grow to fit content (top-left anchored) so nothing clips after adding sections
-        DispatchQueue.main.async { [weak panel] in
-            guard let panel = panel else { return }
-            let fit = hosting.fittingSize
-            if fit.height > 10 && panel.frame.height < fit.height {
-                var f = panel.frame
-                let top = f.maxY
-                f.size.height = fit.height
-                f.origin.y = top - fit.height
-                panel.setFrame(f, display: true)
-                panel.invalidateShadow()
-            }
-        }
+        fitToContent()   // size to current layout (vertical or horizontal), top-left anchored
         model.start()
         // keep it at the forefront even if another app raises a high-level window
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
