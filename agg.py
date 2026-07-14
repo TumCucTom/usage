@@ -32,7 +32,7 @@ ACTIVE_SECS = 120            # a session counts as "running" if its transcript w
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 
 
 # ---------- helpers ----------
@@ -243,7 +243,7 @@ def agg_provider(contribs, now):
     day_today = blank()
     by_model = {}
     by_project = {}
-    by_session = {}
+    named_info = {}   # --resume name -> {"tokens", "last"}
     sessions = set()
     live = 0
     w5h = w24h = w7d = 0
@@ -269,7 +269,9 @@ def agg_provider(contribs, now):
         by_project[c["project"]] = by_project.get(c["project"], 0) + proj_total
         if c.get("named"):   # only sessions with a real --resume name
             lbl = c["session_label"]
-            by_session[lbl] = by_session.get(lbl, 0) + proj_total
+            ni = named_info.setdefault(lbl, {"tokens": 0, "last": 0.0})
+            ni["tokens"] += proj_total
+            ni["last"] = max(ni["last"], c["last_activity"] or 0.0)
         for ep, model, tot in c["recent"]:
             if ep >= cut7:
                 w7d += tot
@@ -285,7 +287,7 @@ def agg_provider(contribs, now):
         "w5h": w5h, "w24h": w24h, "w7d": w7d,
         "by_model": by_model,
         "by_project": by_project,
-        "by_session": by_session,
+        "named_info": named_info,
         "sessions": len(sessions),
         "live": live,
     }
@@ -351,6 +353,27 @@ def count_open_sessions():
     return {"claude_open": claude_open, "codex_open": codex_open, "avail": True}
 
 
+def running_resume_names():
+    """Names currently open via `claude --resume <name>` processes."""
+    try:
+        out = subprocess.run(["ps", "-axo", "command"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return set()
+    names = set()
+    marker = "--resume "
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("claude"):
+            continue
+        i = line.find(marker)
+        if i >= 0:
+            name = line[i + len(marker):].strip().strip('"').strip("'")
+            if name:
+                names.add(name)
+    return names
+
+
 def count_recent_files(files, now, secs):
     n = 0
     cut = now - secs
@@ -409,10 +432,21 @@ def main():
     for src in (claude, codex):
         for k, v in src["by_project"].items():
             by_project_all[k] = by_project_all.get(k, 0) + v
-    by_session_all = {}
+    resume_names = running_resume_names()
+    named_all = {}
     for src in (claude, codex):
-        for k, v in src["by_session"].items():
-            by_session_all[k] = by_session_all.get(k, 0) + v
+        for k, v in src["named_info"].items():
+            e = named_all.setdefault(k, {"tokens": 0, "last": 0.0})
+            e["tokens"] += v["tokens"]
+            e["last"] = max(e["last"], v["last"])
+    named_sessions = [
+        {"name": k, "tokens": v["tokens"], "last_activity": v["last"],
+         "running": k in resume_names}
+        for k, v in named_all.items()
+    ]
+    # keep the 50 most recent so all three UI views (usage/current/recent) have data
+    named_sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+    named_sessions = named_sessions[:50]
 
     # live / open sessions (running vs idle) from process + recent-write inspection
     proc = count_open_sessions()
@@ -451,7 +485,7 @@ def main():
         },
         "combined": combined,
         "top_projects": top_n(by_project_all, 5),
-        "top_sessions": top_n(by_session_all, 5),
+        "named_sessions": named_sessions,
         "live_sessions": live_sessions,
     }
 

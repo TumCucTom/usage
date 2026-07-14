@@ -9,6 +9,16 @@ struct NameTokens: Decodable, Identifiable {
     var id: String { name }
 }
 
+struct NamedSession: Decodable, Identifiable {
+    let name: String
+    let tokens: Int
+    let last_activity: Double
+    let running: Bool
+    var id: String { name }
+}
+
+enum SessView { case usage, current, recent }
+
 struct LimitWindow: Decodable {
     let used_percent: Double?
     let resets_at: Double?
@@ -83,7 +93,7 @@ struct Stats: Decodable {
     let codex: Provider
     let combined: Combined
     let top_projects: [NameTokens]
-    var top_sessions: [NameTokens] = []
+    var named_sessions: [NamedSession] = []
     var live_sessions: LiveSessions? = nil
 }
 
@@ -224,6 +234,7 @@ struct SectionLabel: View {
 struct OverlayView: View {
     @EnvironmentObject var model: OverlayModel
     @State private var now = Date()
+    @State private var sessView: SessView = .usage
     private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -421,26 +432,58 @@ struct OverlayView: View {
     // Where tokens go + sessions -----------------------------------------
     @ViewBuilder
     func whereSection(_ s: Stats) -> some View {
-        HStack {
-            SectionLabel(text: "Named sessions")
+        HStack(spacing: 4) {
+            SectionLabel(text: "Sessions")
             Spacer()
-            Text("--resume name · Claude").font(.system(size: 8)).foregroundColor(.dimmer)
+            segBtn("Usage", .usage)
+            segBtn("Live", .current)
+            segBtn("Recent", .recent)
         }
-        let top = s.top_sessions.prefix(4)
-        if top.isEmpty {
-            Text("no named sessions yet")
+        let list = sortedSessions(s.named_sessions)
+        if list.isEmpty {
+            Text(sessView == .current ? "none running" : "no named sessions yet")
                 .font(.system(size: 9)).foregroundColor(.dimmer)
         }
-        let maxTok = max(1, top.first?.tokens ?? 1)
-        ForEach(Array(top)) { sess in
-            HStack(spacing: 8) {
-                Text(sess.name).font(.system(size: 10)).foregroundColor(.white.opacity(0.75))
-                    .frame(width: 108, alignment: .leading).lineLimit(1).truncationMode(.middle)
+        let maxTok = max(1, list.map { $0.tokens }.max() ?? 1)
+        ForEach(list.prefix(4)) { sess in
+            HStack(spacing: 7) {
+                Circle().fill(sess.running ? Color.liveGreen : Color.clear)
+                    .frame(width: 5, height: 5)
+                Text(sess.name).font(.system(size: 10)).foregroundColor(.white.opacity(0.78))
+                    .frame(width: 104, alignment: .leading).lineLimit(1).truncationMode(.middle)
                 MeterBar(fraction: Double(sess.tokens) / Double(maxTok), color: .white.opacity(0.35), height: 4)
-                Text(fmtTokens(sess.tokens)).font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundColor(.dim).frame(width: 46, alignment: .trailing)
+                Text(sessView == .usage ? fmtTokens(sess.tokens) : agoShort(sess.last_activity))
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundColor(.dim).frame(width: 44, alignment: .trailing)
             }
         }
+    }
+
+    func segBtn(_ title: String, _ v: SessView) -> some View {
+        Button(action: { sessView = v }) {
+            Text(title).font(.system(size: 8, weight: .bold))
+                .foregroundColor(sessView == v ? .white : .dimmer)
+                .padding(.horizontal, 5).padding(.vertical, 1.5)
+                .background(Capsule().fill(sessView == v ? Color.white.opacity(0.16) : Color.clear))
+        }.buttonStyle(.plain)
+    }
+
+    func sortedSessions(_ arr: [NamedSession]) -> [NamedSession] {
+        switch sessView {
+        case .usage:   return arr.sorted { $0.tokens > $1.tokens }
+        case .current: return arr.filter { $0.running }.sorted { $0.last_activity > $1.last_activity }
+        case .recent:  return arr.sorted { $0.last_activity > $1.last_activity }
+        }
+    }
+
+    func agoShort(_ epoch: Double) -> String {
+        let s = Date().timeIntervalSince1970 - epoch
+        if s < 90 { return "now" }
+        let m = Int(s) / 60
+        if m < 60 { return "\(m)m" }
+        let h = m / 60
+        if h < 24 { return "\(h)h" }
+        return "\(h / 24)d"
     }
 
     func footer(_ s: Stats) -> some View {
