@@ -892,7 +892,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)   // no dock icon, menu-bar-agent style
+        NSApp.setActivationPolicy(.regular)     // show a Dock icon + app-switcher entry
 
         let hosting = ClickThroughHostingView(
             rootView: AnyView(OverlayView().environmentObject(model)))
