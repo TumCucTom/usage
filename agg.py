@@ -27,24 +27,31 @@ LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
 ACTIVE_SECS = 120            # a session counts as "running" (actively generating) if written this recently
 RUNNING_SECS = 60            # tighter window for the open/running/idle footer split
 RATE_RECENCY = 90 * 60       # only trust Codex rate-limit readings this fresh
-RATE_WINDOW_TOL = 20 * 60    # resets_at within this = same limit window (drift, not a reset)
 LIVE_TOLERANCE = 45 * 60     # a named session still counts as "live/idle" if used within this window
+
+
+def _is_base_limit(e):
+    """The base plan rate limit (limit_id 'codex', no descriptive name) rather than
+    a model-specific sub-limit like GPT-5.3-Codex-Spark (limit_id 'codex_<model>',
+    with a limit_name). Different models put their own limit in the primary slot, so
+    concurrent sessions on different models report different limit_ids for the same
+    window; the base limit is the one the user thinks of as "my Codex usage"."""
+    lid = e.get("limit_id")
+    if lid == "codex":
+        return True
+    return lid is None and not e.get("limit_name")   # older logs had no limit_id
 
 
 def _rate_beats(new, old):
     """True if reading `new` should replace `old` for the same window key.
 
-    A meaningfully later resets_at means a newer limit window (e.g. right after a
-    reset, when resets_at jumps forward by the full window length) and always wins,
-    so a stale pre-reset percentage can't linger. Within the same window (resets_at
-    values differ only by drift) the higher percent wins, so concurrent 0% API-key
-    noise never masks real plan usage."""
-    nra = new.get("resets_at") or 0
-    ora = old.get("resets_at") or 0
-    if abs(nra - ora) > RATE_WINDOW_TOL:
-        return nra > ora
-    if new["used_percent"] != old["used_percent"]:
-        return new["used_percent"] > old["used_percent"]
+    Prefer the base plan limit over a model-specific sub-limit; among readings of the
+    same tier, the most recent one wins. Recency alone tracks resets correctly — after
+    a reset the newest reading carries the fresh low percentage — so no resets_at
+    juggling is needed, and same-limit concurrent sessions agree on current usage."""
+    nb, ob = _is_base_limit(new), _is_base_limit(old)
+    if nb != ob:
+        return nb
     return new["ts"] > old["ts"]
 
 # Claude Code does NOT expose rate-limit percentages locally, so Claude usage %
@@ -53,7 +60,7 @@ def _rate_beats(new, old):
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 11
+CACHE_VERSION = 12
 
 
 # ---------- helpers ----------
@@ -224,7 +231,9 @@ def parse_codex_file(path, now):
                                 continue
                             cand = {"used_percent": up, "resets_at": ra,
                                     "window_minutes": win, "ts": ep,
-                                    "plan": rl.get("plan_type")}
+                                    "plan": rl.get("plan_type"),
+                                    "limit_id": w.get("limit_id") or rl.get("limit_id"),
+                                    "limit_name": w.get("limit_name") or rl.get("limit_name")}
                             cur = best_win.get(key)
                             # newest window wins; ties within a window keep the real usage
                             if cur is None or _rate_beats(cand, cur):
