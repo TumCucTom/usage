@@ -920,7 +920,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = false    // window shadow is square around the rounded card — drop it for clean edges
         panel.level = .statusBar   // above ordinary app windows (e.g. Slack), stays at the forefront
         panel.isMovableByWindowBackground = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        // .managed (not .canJoinAllSpaces) keeps the panel on the single desktop Space it was
+        // created on, so it doesn't follow you into a fullscreen app's Space — it stays behind
+        // on the home/desktop where the Dock lives. .stationary keeps it fixed during Exposé.
+        panel.collectionBehavior = [.managed, .stationary]
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.minSize = NSSize(width: 256, height: 200)
