@@ -21,6 +21,8 @@ CODEX_DIR = os.path.join(HOME, ".codex", "sessions")
 SUPPORT = os.path.join(HOME, "Library", "Application Support", "CCStat")
 CACHE_PATH = os.path.join(SUPPORT, "cache.json")
 STATS_PATH = os.path.join(SUPPORT, "stats.json")
+ARCHIVE_PATH = os.path.join(SUPPORT, "lifetime_archive.json")   # durable lifetime of deleted transcripts
+ARCHIVE_VERSION = 1
 
 RECENT_RETAIN = 10 * 86400   # keep per-event points for 10 days (covers 7d window + margin)
 LIVE_WINDOW = 15 * 60        # a session is "live" if touched in the last 15 min
@@ -290,12 +292,54 @@ def nocache_of(b):
     return b["input"] + b["output"]
 
 
-def agg_provider(contribs, now):
+def _lifetime_summary(c):
+    """Compact per-file lifetime contribution (token scalars + per-model / per-project
+    totals) — what we persist for a transcript so its tokens survive the file's deletion."""
+    life = blank()
+    by_model = {}
+    proj_total = 0
+    for day, models in c["days"].items():
+        for model, v in models.items():
+            tot = v[0] + v[1] + v[2] + v[3]
+            life["input"] += v[0]; life["output"] += v[1]
+            life["cache_creation"] += v[2]; life["cache_read"] += v[3]
+            by_model[model] = by_model.get(model, 0) + tot
+            proj_total += tot
+    return {"provider": c["provider"], "life": life,
+            "by_model": by_model, "by_project": {c["project"]: proj_total}}
+
+
+def _archive_seed(archive_files, provider):
+    """Sum the persisted contributions of deleted transcripts for one provider into
+    (life, by_model, by_project) accumulators to seed a fresh lifetime aggregation."""
+    life = blank()
+    by_model = {}
+    by_project = {}
+    for e in archive_files.values():
+        if e.get("provider") != provider:
+            continue
+        el = e.get("life", {})
+        for k in life:
+            life[k] += el.get(k, 0)
+        for m, t in e.get("by_model", {}).items():
+            by_model[m] = by_model.get(m, 0) + t
+        for p, t in e.get("by_project", {}).items():
+            by_project[p] = by_project.get(p, 0) + t
+    return life, by_model, by_project
+
+
+def agg_provider(contribs, now, seed=None):
     today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
     life = blank()
     day_today = blank()
     by_model = {}
     by_project = {}
+    if seed:   # persisted lifetime of deleted transcripts — only lifetime views, never today/windows
+        seed_life, seed_by_model, seed_by_project = seed
+        for k in life:
+            life[k] = seed_life.get(k, 0)
+        by_model = dict(seed_by_model)
+        by_project = dict(seed_by_project)
     named_info = {}   # --resume name -> {"tokens", "last"}
     sessions = set()
     live = 0
@@ -705,8 +749,34 @@ def main():
     live_keys = set(claude_files) | set(codex_files)
     new_cache = {k: v for k, v in cache.items() if k in live_keys}
 
-    claude = agg_provider(cc, now)
-    codex = agg_provider(cx, now)
+    # Persist lifetime across deletions: before we forget a transcript that's no longer on
+    # disk, fold its token totals into a durable archive so lifetime never drops when
+    # Claude/Codex rotate logs or the user clears old sessions. (A file that lived and died
+    # entirely while the app was off can't be captured — nothing ever cached it.)
+    archive = {}
+    if os.path.exists(ARCHIVE_PATH):
+        try:
+            raw = json.load(open(ARCHIVE_PATH))
+            if raw.get("v") == ARCHIVE_VERSION:
+                archive = raw.get("files", {})
+        except Exception:
+            archive = {}
+    for key, ent in cache.items():
+        if key in live_keys or key in archive:
+            continue
+        c = ent.get("c")
+        if c:
+            archive[key] = _lifetime_summary(c)
+    for key in list(archive):        # a deleted file that reappeared is counted live again
+        if key in live_keys:
+            del archive[key]
+    try:
+        json.dump({"v": ARCHIVE_VERSION, "files": archive}, open(ARCHIVE_PATH, "w"))
+    except Exception:
+        pass
+
+    claude = agg_provider(cc, now, _archive_seed(archive, "claude"))
+    codex = agg_provider(cx, now, _archive_seed(archive, "codex"))
 
     combined = {
         "lifetime_total": claude["lifetime_total"] + codex["lifetime_total"],
