@@ -324,7 +324,10 @@ def agg_provider(contribs, now):
                     day_today["input"] += v[0]; day_today["output"] += v[1]
                     day_today["cache_creation"] += v[2]; day_today["cache_read"] += v[3]
         by_project[c["project"]] = by_project.get(c["project"], 0) + proj_total
-        if c.get("named"):   # only sessions with a real --resume name
+        # Claude: only sessions the user gave a --resume name (filters out ephemeral
+        # sub-agent transcripts). Codex has no --resume names but every file is a real
+        # session, so include all of them keyed by their proj·<sid> label.
+        if c.get("named") or c["provider"] == "codex":
             lbl = c["session_label"]
             ni = named_info.setdefault(lbl, {"tokens": 0, "tokens_nc": 0, "last": 0.0, "paths": []})
             ni["tokens"] += proj_total
