@@ -87,6 +87,9 @@ struct Provider: Decodable {
     var limits: CodexLimits? = nil
     var limits_pct: LimitsPct? = nil
     var real_limits: RealLimits? = nil
+    var cost_today: Double = 0
+    var cost_7d: Double = 0
+    var cost_lifetime: Double = 0
 }
 
 struct Combined: Decodable {
@@ -101,6 +104,9 @@ struct Combined: Decodable {
     var lifetime_nc: Int = 0
     var today_nc: Int = 0
     var w7d_nc: Int = 0
+    var cost_today: Double = 0
+    var cost_7d: Double = 0
+    var cost_lifetime: Double = 0
 }
 
 struct LiveSlot: Decodable {
@@ -137,6 +143,14 @@ func fmtTokens(_ n: Int) -> String {
     if d >= 1e6 { return String(format: "%.1fM", d / 1e6) }
     if d >= 1e3 { return String(format: "%.0fK", d / 1e3) }
     return "\(n)"
+}
+
+// Estimated API dollar cost (what it would cost at API rates; usage is mostly on-plan).
+func fmtCost(_ v: Double) -> String {
+    if v >= 1000 { return String(format: "$%.1fk", v / 1000) }
+    if v >= 100  { return String(format: "$%.0f", v) }
+    if v >= 10   { return String(format: "$%.1f", v) }
+    return String(format: "$%.2f", v)
 }
 
 func fmtReset(_ epoch: Double?) -> String {
@@ -617,24 +631,24 @@ struct OverlayView: View {
     @ViewBuilder
     func totalsSection(_ s: Stats) -> some View {
         HStack(spacing: 10) {
-            bigTotal("TODAY", tok(s.combined.today_total, s.combined.today_nc), .white)
-            bigTotal("WEEK", tok(s.combined.w7d, s.combined.w7d_nc), .white.opacity(0.9))
-            bigTotal("LIFETIME", tok(s.combined.lifetime_total, s.combined.lifetime_nc), .white.opacity(0.8))
+            bigTotal("TODAY", tok(s.combined.today_total, s.combined.today_nc), .white, s.combined.cost_today)
+            bigTotal("WEEK", tok(s.combined.w7d, s.combined.w7d_nc), .white.opacity(0.9), s.combined.cost_7d)
+            bigTotal("LIFETIME", tok(s.combined.lifetime_total, s.combined.lifetime_nc), .white.opacity(0.8), s.combined.cost_lifetime)
         }
         HStack(spacing: 6) {
             splitPill("Claude", .claudeAccent, tok(s.claude.today_total, s.claude.today_nc))
             splitPill("Codex", .codexAccent, tok(s.codex.today_total, s.codex.today_nc))
             Spacer()
-            Text(cacheNote).font(.system(size: 8)).foregroundColor(.dimmer)
+            Text("est API $ · \(cacheNote)").font(.system(size: 8)).foregroundColor(.dimmer)
         }
     }
 
     @ViewBuilder
     func totalsCompact(_ s: Stats) -> some View {
         SectionLabel(text: "Tokens")
-        compactTotal("TODAY", tok(s.combined.today_total, s.combined.today_nc))
-        compactTotal("WEEK", tok(s.combined.w7d, s.combined.w7d_nc))
-        compactTotal("LIFE", tok(s.combined.lifetime_total, s.combined.lifetime_nc))
+        compactTotal("TODAY", tok(s.combined.today_total, s.combined.today_nc), s.combined.cost_today)
+        compactTotal("WEEK", tok(s.combined.w7d, s.combined.w7d_nc), s.combined.cost_7d)
+        compactTotal("LIFE", tok(s.combined.lifetime_total, s.combined.lifetime_nc), s.combined.cost_lifetime)
         HStack(spacing: 5) {
             Circle().fill(Color.claudeAccent).frame(width: 5, height: 5)
             Text(fmtTokens(tok(s.claude.today_total, s.claude.today_nc))).font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.7))
@@ -644,20 +658,25 @@ struct OverlayView: View {
         Text(cacheNote).font(.system(size: 8)).foregroundColor(.dimmer)
     }
 
-    func compactTotal(_ label: String, _ v: Int) -> some View {
+    func compactTotal(_ label: String, _ v: Int, _ cost: Double) -> some View {
         HStack(spacing: 4) {
             Text(label).font(.system(size: 8, weight: .heavy)).tracking(0.5).foregroundColor(.dim)
                 .frame(width: 44, alignment: .leading)
             Text(fmtTokens(v)).font(.system(size: 13, weight: .bold, design: .rounded))
                 .foregroundColor(.white).minimumScaleFactor(0.7).lineLimit(1)
+            Spacer(minLength: 4)
+            Text(fmtCost(cost)).font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(Color(red: 0.45, green: 0.82, blue: 0.5)).minimumScaleFactor(0.7).lineLimit(1)
         }
     }
 
-    func bigTotal(_ label: String, _ v: Int, _ color: Color) -> some View {
+    func bigTotal(_ label: String, _ v: Int, _ color: Color, _ cost: Double) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label).font(.system(size: 8, weight: .heavy)).tracking(0.8).foregroundColor(.dim)
             Text(fmtTokens(v)).font(.system(size: 17, weight: .bold, design: .rounded))
                 .foregroundColor(color).minimumScaleFactor(0.6).lineLimit(1)
+            Text(fmtCost(cost)).font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundColor(Color(red: 0.45, green: 0.82, blue: 0.5)).minimumScaleFactor(0.6).lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

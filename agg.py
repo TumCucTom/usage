@@ -62,7 +62,7 @@ def _rate_beats(new, old):
 CLAUDE_5H_LIMIT = 2_000_000_000
 CLAUDE_WEEK_LIMIT = 12_000_000_000
 
-CACHE_VERSION = 12
+CACHE_VERSION = 13   # bumped: recent[] now carries per-type token split for cost estimates
 
 
 # ---------- helpers ----------
@@ -96,7 +96,7 @@ def add4(dst, key, vals):
 # Each returns a compact "contribution" dict:
 #   { provider, project, sessions:[...], last_activity:epoch,
 #     days:{ "YYYY-MM-DD": { model:[in,out,cache_creation,cache_read] } },
-#     recent:[ [epoch, model, total_tokens], ... ]   # last RECENT_RETAIN secs only
+#     recent:[ [epoch, model, input, output, cache_create, cache_read], ... ]  # last RECENT_RETAIN secs
 #     codex_rate: {..} | None,  codex_rate_ts: epoch | None }
 
 
@@ -154,7 +154,7 @@ def parse_claude_file(path, now):
                 dd = days.setdefault(day, {})
                 add4(dd, model, (it, ot, cc, cr))
                 if ep >= horizon:
-                    recent.append([ep, model, it + ot + cc + cr, it + ot])
+                    recent.append([ep, model, it, ot, cc, cr])
     except Exception:
         return None
     return {
@@ -214,7 +214,8 @@ def parse_codex_file(path, now):
                         out = tot - it if tot > it else ot   # exact output, avoids reasoning double-count
                         add4(dd, model, (nc_in, out, 0, cin))
                         if ep >= horizon:
-                            recent.append([ep, model, tot, max(0, tot - cin)])
+                            # same per-type split as the days tuple: (fresh in, out, 0, cached read)
+                            recent.append([ep, model, nc_in, out, 0, cin])
                     rl = p.get("rate_limits")
                     if isinstance(rl, dict) and ep and ep >= now - RATE_RECENCY:
                         for slot in ("primary", "secondary"):
@@ -292,11 +293,41 @@ def nocache_of(b):
     return b["input"] + b["output"]
 
 
+# ---------- API cost estimate ----------
+# Public API list prices, USD per MILLION tokens: (input, output, cache_write, cache_read).
+# Real usage is mostly on a subscription plan; these are only "what it would cost if every
+# token were billed at API rates". The row is picked by keyword match on the model name.
+_PRICES = {
+    "opus":   (15.0, 75.0, 18.75, 1.50),
+    "sonnet": (3.0,  15.0,  3.75, 0.30),
+    "haiku":  (1.0,   5.0,  1.25, 0.10),
+    "gpt5":   (1.25, 10.0,  0.0,  0.125),   # gpt-5 / codex: cached input priced as cache_read
+}
+
+
+def _price_row(model):
+    m = (model or "").lower()
+    if "opus" in m: return _PRICES["opus"]
+    if "haiku" in m: return _PRICES["haiku"]
+    if "sonnet" in m or "claude" in m: return _PRICES["sonnet"]
+    if "gpt" in m or "codex" in m: return _PRICES["gpt5"]
+    return _PRICES["sonnet"]   # unknown -> mid-tier default
+
+
+def cost_of(model, it, ot, cc, cr):
+    """Estimated API dollar cost of one (input, output, cache-write, cache-read) split."""
+    pi, po, pw, pr = _price_row(model)
+    return (it * pi + ot * po + cc * pw + cr * pr) / 1_000_000.0
+
+
 def _lifetime_summary(c):
     """Compact per-file lifetime contribution (token scalars + per-model / per-project
-    totals) — what we persist for a transcript so its tokens survive the file's deletion."""
+    totals) — what we persist for a transcript so its tokens survive the file's deletion.
+    by_model_typed keeps the per-type split per model so API cost stays accurate after
+    the file is gone."""
     life = blank()
     by_model = {}
+    by_model_typed = {}
     proj_total = 0
     for day, models in c["days"].items():
         for model, v in models.items():
@@ -304,17 +335,20 @@ def _lifetime_summary(c):
             life["input"] += v[0]; life["output"] += v[1]
             life["cache_creation"] += v[2]; life["cache_read"] += v[3]
             by_model[model] = by_model.get(model, 0) + tot
+            t = by_model_typed.setdefault(model, [0, 0, 0, 0])
+            t[0] += v[0]; t[1] += v[1]; t[2] += v[2]; t[3] += v[3]
             proj_total += tot
-    return {"provider": c["provider"], "life": life,
-            "by_model": by_model, "by_project": {c["project"]: proj_total}}
+    return {"provider": c["provider"], "life": life, "by_model": by_model,
+            "by_model_typed": by_model_typed, "by_project": {c["project"]: proj_total}}
 
 
 def _archive_seed(archive_files, provider):
     """Sum the persisted contributions of deleted transcripts for one provider into
-    (life, by_model, by_project) accumulators to seed a fresh lifetime aggregation."""
+    (life, by_model, by_project, cost) accumulators to seed a fresh lifetime aggregation."""
     life = blank()
     by_model = {}
     by_project = {}
+    cost = 0.0
     for e in archive_files.values():
         if e.get("provider") != provider:
             continue
@@ -323,9 +357,11 @@ def _archive_seed(archive_files, provider):
             life[k] += el.get(k, 0)
         for m, t in e.get("by_model", {}).items():
             by_model[m] = by_model.get(m, 0) + t
+        for m, t in e.get("by_model_typed", {}).items():
+            cost += cost_of(m, t[0], t[1], t[2], t[3])
         for p, t in e.get("by_project", {}).items():
             by_project[p] = by_project.get(p, 0) + t
-    return life, by_model, by_project
+    return life, by_model, by_project, cost
 
 
 def agg_provider(contribs, now, seed=None):
@@ -334,17 +370,21 @@ def agg_provider(contribs, now, seed=None):
     day_today = blank()
     by_model = {}
     by_project = {}
+    cost_life = 0.0
     if seed:   # persisted lifetime of deleted transcripts — only lifetime views, never today/windows
-        seed_life, seed_by_model, seed_by_project = seed
+        seed_life, seed_by_model, seed_by_project, seed_cost = seed
         for k in life:
             life[k] = seed_life.get(k, 0)
         by_model = dict(seed_by_model)
         by_project = dict(seed_by_project)
+        cost_life = seed_cost
     named_info = {}   # --resume name -> {"tokens", "last"}
     sessions = set()
     live = 0
     w5h = w24h = w7d = 0
     w5h_nc = w24h_nc = w7d_nc = 0
+    cost_today = 0.0
+    cost_5h = cost_24h = cost_7d = 0.0
     cut5 = now - 5 * 3600
     cut24 = now - 24 * 3600
     cut7 = now - 7 * 86400
@@ -359,14 +399,17 @@ def agg_provider(contribs, now, seed=None):
             for model, v in models.items():
                 tot = v[0] + v[1] + v[2] + v[3]   # all tokens incl cache
                 nc = v[0] + v[1]                  # non-cache (input+output)
+                ec = cost_of(model, v[0], v[1], v[2], v[3])   # est. API $ for this slice
                 life["input"] += v[0]; life["output"] += v[1]
                 life["cache_creation"] += v[2]; life["cache_read"] += v[3]
                 by_model[model] = by_model.get(model, 0) + tot
                 proj_total += tot
                 proj_nc += nc
+                cost_life += ec
                 if day == today:
                     day_today["input"] += v[0]; day_today["output"] += v[1]
                     day_today["cache_creation"] += v[2]; day_today["cache_read"] += v[3]
+                    cost_today += ec
         by_project[c["project"]] = by_project.get(c["project"], 0) + proj_total
         # Claude: only sessions the user gave a --resume name (filters out ephemeral
         # sub-agent transcripts). Codex has no --resume names but every file is a real
@@ -380,14 +423,23 @@ def agg_provider(contribs, now, seed=None):
             if c.get("path"):
                 ni["paths"].append(c["path"])
         for ev in c["recent"]:
-            ep, tot = ev[0], ev[2]
-            nc = ev[3] if len(ev) > 3 else tot
+            ep = ev[0]
+            if len(ev) >= 6:                       # [ep, model, in, out, cache_create, cache_read]
+                m_r, i_r, o_r, cc_r, cr_r = ev[1], ev[2], ev[3], ev[4], ev[5]
+            else:                                  # legacy pre-v13 shape [ep, model, tot, nc]
+                m_r = ev[1] if len(ev) > 1 else ""
+                tot_r = ev[2] if len(ev) > 2 else 0
+                nc_r = ev[3] if len(ev) > 3 else tot_r
+                i_r, o_r, cc_r, cr_r = nc_r, 0, 0, max(0, tot_r - nc_r)
+            tot = i_r + o_r + cc_r + cr_r
+            nc = i_r + o_r
+            ec = cost_of(m_r, i_r, o_r, cc_r, cr_r)
             if ep >= cut7:
-                w7d += tot; w7d_nc += nc
+                w7d += tot; w7d_nc += nc; cost_7d += ec
                 if ep >= cut24:
-                    w24h += tot; w24h_nc += nc
+                    w24h += tot; w24h_nc += nc; cost_24h += ec
                     if ep >= cut5:
-                        w5h += tot; w5h_nc += nc
+                        w5h += tot; w5h_nc += nc; cost_5h += ec
     return {
         "lifetime": life,
         "lifetime_total": total_of(life),
@@ -397,6 +449,9 @@ def agg_provider(contribs, now, seed=None):
         "today_nc": nocache_of(day_today),
         "w5h": w5h, "w24h": w24h, "w7d": w7d,
         "w5h_nc": w5h_nc, "w24h_nc": w24h_nc, "w7d_nc": w7d_nc,
+        "cost_today": round(cost_today, 4),
+        "cost_7d": round(cost_7d, 4),
+        "cost_lifetime": round(cost_life, 4),
         "by_model": by_model,
         "by_project": by_project,
         "named_info": named_info,
@@ -792,6 +847,9 @@ def main():
         "sessions": claude["sessions"] + codex["sessions"],
         "live": claude["live"] + codex["live"],
         "cache_read": claude["lifetime"]["cache_read"] + codex["lifetime"]["cache_read"],
+        "cost_today": round(claude["cost_today"] + codex["cost_today"], 4),
+        "cost_7d": round(claude["cost_7d"] + codex["cost_7d"], 4),
+        "cost_lifetime": round(claude["cost_lifetime"] + codex["cost_lifetime"], 4),
     }
     by_project_all = {}
     for src in (claude, codex):
@@ -834,6 +892,7 @@ def main():
         "claude": {
             **{k: claude[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d",
                                       "lifetime_nc", "today_nc", "w5h_nc", "w24h_nc", "w7d_nc",
+                                      "cost_today", "cost_7d", "cost_lifetime",
                                       "sessions", "live")},
             "lifetime_breakdown": claude["lifetime"],
             "top_models": top_n(claude["by_model"]),
@@ -849,6 +908,7 @@ def main():
         "codex": {
             **{k: codex[k] for k in ("lifetime_total", "today_total", "w5h", "w24h", "w7d",
                                      "lifetime_nc", "today_nc", "w5h_nc", "w24h_nc", "w7d_nc",
+                                     "cost_today", "cost_7d", "cost_lifetime",
                                      "sessions", "live")},
             "lifetime_breakdown": codex["lifetime"],
             "top_models": top_n(codex["by_model"]),
